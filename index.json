@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-11-24T00:13:31Z",
+  "plugins": [
+    {
+      "id": "douyin-scroll",
+      "version": "0.1.0",
+      "kind": "script",
+      "name": "刷抖音",
+      "description": "通过本机桥接读取抖音推荐流，按兴趣挑一条念给桌宠听，绝不自动发送任何内容。",
+      "author": "CYoJkoY",
+      "tags": [
+        "抖音",
+        "推荐流",
+        "桥接"
+      ],
+      "permissions": [
+        "pet",
+        "bridge"
+      ],
+      "harness": "zig-wasm32-freestanding/abi1",
+      "size": 68664,
+      "sha256": "cb2966b6bbf8204772319ba9fc2481a54749ff6bac5114604b71592d6b18d8c7",
+      "manifest": "plugins/douyin-scroll/plugin.json",
+      "wasm": "plugins/douyin-scroll/plugin.wasm",
+      "labels": {
+        "zh": "刷抖音",
+        "en": "Douyin Scroller"
+      },
+      "homepage": "https://github.com/CYoJkoY/DaFeiYu-Max-Plugins",
+      "source": "plugins/douyin-scroll/src/main.zig"
+    }
+  ]
+}

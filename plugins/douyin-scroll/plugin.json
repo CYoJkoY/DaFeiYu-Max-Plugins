@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "id": "douyin-scroll",
+  "version": "0.1.0",
+  "kind": "script",
+  "name": "刷抖音",
+  "labels": { "zh": "刷抖音", "en": "Douyin Scroller" },
+  "description": "通过本机桥接读取抖音推荐流，按兴趣挑一条念给桌宠听，绝不自动发送任何内容。",
+  "author": "CYoJkoY",
+  "homepage": "https://github.com/CYoJkoY/DaFeiYu-Max-Plugins",
+  "tags": ["抖音", "推荐流", "桥接"],
+  "requiresTrust": true,
+  "script": {
+    "abi": 1,
+    "entry": "plugin.wasm",
+    "permissions": ["pet", "bridge"],
+    "settings": [
+      {
+        "id": "bridgeUrl",
+        "type": "url",
+        "label": "抖音桥接地址",
+        "placeholder": "http://127.0.0.1:8765"
+      },
+      {
+        "id": "intervalSeconds",
+        "type": "number",
+        "label": "刷新间隔（秒）",
+        "default": 20,
+        "min": 5,
+        "max": 300
+      },
+      {
+        "id": "interestBoost",
+        "type": "boolean",
+        "label": "优先推送兴趣关键词",
+        "default": true
+      }
+    ],
+    "commands": ["next", "reset", "stats"]
+  }
+}

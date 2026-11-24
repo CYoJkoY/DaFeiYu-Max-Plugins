@@ -1,0 +1,8 @@
+{
+  "items": [
+    { "id": "d-1001", "title": "Zig 写插件真香", "author": "某鱼", "url": "https://www.douyin.com/", "hot": 1200 },
+    { "id": "d-1002", "title": "DeepSeek 新模型上手", "author": "模型观察", "url": "https://www.douyin.com/", "hot": 76000 },
+    { "id": "d-1003", "title": "手工编织的小鱼挂件", "author": "织织", "url": "https://www.douyin.com/", "hot": 5400 },
+    { "id": "d-1004", "title": "今天也在认真吃饭", "author": "干饭人", "url": "https://www.douyin.com/", "hot": 2100000 }
+  ]
+}

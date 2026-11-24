@@ -58,6 +58,9 @@ pub const Json = struct {
     alloc: Allocator,
     buf: std.ArrayList(u8) = .empty,
     levels: std.ArrayList(Level) = .empty,
+    /// Names of every object member written so far, in order. The reply state
+    /// uses this to know which persisted keys a handler has overridden.
+    keys: std.ArrayList([]const u8) = .empty,
     pending_key: bool = false,
 
     pub fn init(alloc: Allocator) Json {
@@ -67,6 +70,7 @@ pub const Json = struct {
     pub fn deinit(self: *Json) void {
         self.buf.deinit(self.alloc);
         self.levels.deinit(self.alloc);
+        self.keys.deinit(self.alloc);
     }
 
     pub fn slice(self: Json) []const u8 {
@@ -121,6 +125,7 @@ pub const Json = struct {
         try self.beforeValue();
         try self.writeString(name);
         try self.put(':');
+        try self.keys.append(self.alloc, name);
         self.pending_key = true;
     }
 
@@ -291,8 +296,15 @@ pub fn eql(a: []const u8, b: []const u8) bool {
 ///
 /// `state` and the two effect lists are rendered separately and spliced at the
 /// end, so a handler can append pet reactions and HTTP requests in any order.
+///
+/// The state you return is *merged* over the state the host sent in: keys you
+/// write win, keys you leave alone keep their persisted value, and
+/// `stateRemove` deletes one. That way a handler only has to describe what
+/// changed, and a `tick` that forgets to echo `seen` cannot silently erase it.
 pub const Reply = struct {
     alloc: Allocator,
+    /// The state the host handed us; anything not overridden is carried through.
+    initial: Value,
     state: Json,
     effects: Json,
     pet: Json,
@@ -303,9 +315,10 @@ pub const Reply = struct {
     schedule_ms: ?u64 = null,
     disable_flag: bool = false,
 
-    pub fn init(alloc: Allocator) !Reply {
+    pub fn init(alloc: Allocator, initial: Value) !Reply {
         var reply = Reply{
             .alloc = alloc,
+            .initial = initial,
             .state = Json.init(alloc),
             .effects = Json.init(alloc),
             .pet = Json.init(alloc),
@@ -340,6 +353,11 @@ pub const Reply = struct {
     /// (`key` → `beginArray` → … → `endArray`, or `key` → `value`).
     pub fn stateWriter(self: *Reply) *Json {
         return &self.state;
+    }
+
+    /// Delete a persisted key by not emitting it.
+    pub fn stateRemove(self: *Reply, key_name: []const u8) !void {
+        try self.state.keys.append(self.alloc, key_name);
     }
 
     pub fn stateStr(self: *Reply, key_name: []const u8, value_text: []const u8) !void {
@@ -452,9 +470,33 @@ pub const Reply = struct {
         try self.state.endObject();
         try self.effects.endArray();
         try self.pet.endArray();
+        // Merge: persisted keys first, minus the ones the handler overrode,
+        // then the handler's own members spliced in last so they win.
+        var merged = Json.init(self.alloc);
+        defer merged.deinit();
+        try merged.beginObject();
+        if (self.initial == .object) {
+            var it = self.initial.object.iterator();
+            while (it.next()) |entry| {
+                const name = entry.key_ptr.*;
+                var overridden = false;
+                for (self.state.keys.items) |written| {
+                    if (std.mem.eql(u8, written, name)) {
+                        overridden = true;
+                        break;
+                    }
+                }
+                if (overridden) continue;
+                try merged.key(name);
+                try merged.value(entry.value_ptr.*);
+            }
+        }
+        const body = self.state.buf.items;
+        if (body.len > 2) try merged.raw(body[1 .. body.len - 1]);
+        try merged.endObject();
         try out.beginObject();
         try out.key("state");
-        try out.raw(self.state.buf.items);
+        try out.raw(merged.buf.items);
         try out.key("effects");
         try out.raw(self.effects.buf.items);
         try out.key("pet");
@@ -568,7 +610,7 @@ fn invokeWith(
     };
     defer parsed.deinit();
 
-    var reply = Reply.init(alloc) catch {
+    var reply = Reply.init(alloc, get(parsed.value, "state") orelse .null) catch {
         return copyOut(out_ptr, out_cap, FALLBACK);
     };
     defer reply.deinit();

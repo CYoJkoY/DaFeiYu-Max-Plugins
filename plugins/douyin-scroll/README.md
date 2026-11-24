@@ -19,6 +19,12 @@
 
 `items[].id` 必填且需唯一；`url` 必须是 `https://` 链接才会被采纳。
 
+仓库自带的 `tools/bridge.ts` 就是一份可直接运行的示例：
+
+```sh
+node tools/bridge.ts            # http://127.0.0.1:8765，读 tools/feed.json
+```
+
 ## 设置项
 
 | id | 类型 | 说明 |

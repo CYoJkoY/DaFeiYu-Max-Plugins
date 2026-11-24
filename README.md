@@ -46,6 +46,20 @@ scripts/build-index.ts      按现有模块重算 size / sha256 并重建 index.
 5. 运行 `node scripts/validate.ts` 确认本地一致。
 6. 运行 `node scripts/build-index.ts` 重建 `index.json`，提交并推送。
 
+## 本地试跑（刷抖音）
+
+`plugins/douyin-scroll` 需要一份本机桥接数据。仓库自带一个零依赖示例：
+
+```sh
+node tools/bridge.ts            # http://127.0.0.1:8765，读 tools/feed.json
+node tools/bridge.ts --port 8766 --feed D:/我的数据.json
+```
+
+它只监听 `127.0.0.1`、只读本地 JSON，提供 `GET /feed?limit=20`、`GET /status`，
+不登录抖音、不抓取、不上传。把主应用里的「桥接地址」填成同一个地址，插件就会
+从这份数据里按兴趣挑一条念给你听。想接真实数据源，就替换这个进程——只要
+`/feed` 的返回形状不变。
+
 ## 两条红线
 
 - 只声明真正需要的权限；`net` 必须列出 `allowHosts`。

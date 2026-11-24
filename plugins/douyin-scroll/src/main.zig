@@ -72,7 +72,6 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
 
     const counter = dfy.getInt(ctx.state, "counter") orelse 0;
     const seen = dfy.getList(ctx.state, "seen");
-    try reply.stateInt("counter", counter);
 
     if (dfy.eql(kind, "install")) {
         reply.status("刷抖音插件已就绪", null, counter);
@@ -98,7 +97,15 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
     if (dfy.eql(kind, "command")) {
         const name = dfy.getStr(ctx.event, "name") orelse "";
         if (dfy.eql(name, "reset")) {
+            // The reply merges over persisted state, so deleting means naming
+            // the key without writing a value.
             try reply.stateInt("counter", 0);
+            try reply.stateRemove("seen");
+            try reply.stateRemove("seenCount");
+            try reply.stateRemove("lastTitle");
+            try reply.stateRemove("lastUrl");
+            try reply.stateRemove("lastFetchAt");
+            try reply.stateRemove("available");
             try reply.say("计数清零，重新开始刷。");
             reply.status("已重置刷抖音计数", null, 0);
             reply.schedule(1500);

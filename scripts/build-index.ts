@@ -3,6 +3,10 @@
  * module size and SHA-256. Run after each Zig rebuild.
  *
  * Run with `node scripts/build-index.ts` from the repository root.
+ *
+ * `generatedAt` only moves when the plugin list actually changes, so a rebuild
+ * of an unchanged repository is a no-op. `--check` performs the rebuild in
+ * memory and fails when the file on disk would change, which is what CI runs.
  */
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
@@ -34,6 +38,7 @@ interface Entry {
   source?: string;
 }
 
+const check = process.argv.includes('--check');
 const entries: Entry[] = [];
 const problems: string[] = [];
 
@@ -94,10 +99,37 @@ if (problems.length) {
   process.exit(1);
 }
 
+const indexPath = join(root, 'index.json');
+const previous = existsSync(indexPath) ? readFileSync(indexPath, 'utf8') : null;
+const unchanged =
+  previous !== null && (() => {
+    try {
+      const parsed = JSON.parse(previous) as { schemaVersion?: unknown; generatedAt?: unknown; plugins?: unknown };
+      return parsed.schemaVersion === 1
+        && typeof parsed.generatedAt === 'string'
+        && JSON.stringify(parsed.plugins) === JSON.stringify(entries);
+    } catch {
+      return false;
+    }
+  })();
+
 const index = {
   schemaVersion: 1,
-  generatedAt: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
+  generatedAt: unchanged
+    ? (JSON.parse(previous) as { generatedAt: string }).generatedAt
+    : new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
   plugins: entries,
 };
-writeFileSync(join(root, 'index.json'), `${JSON.stringify(index, null, 2)}\n`);
-console.log(`已重建 index.json，包含 ${entries.length} 个插件。`);
+const rendered = `${JSON.stringify(index, null, 2)}\n`;
+
+if (check) {
+  if (previous === rendered) {
+    console.log(`index.json 无漂移，包含 ${entries.length} 个插件。`);
+  } else {
+    console.error('index.json 与仓库内容不一致。请先运行 node scripts/build-index.ts 并提交。');
+    process.exit(1);
+  }
+} else {
+  writeFileSync(indexPath, rendered);
+  console.log(`已重建 index.json，包含 ${entries.length} 个插件。`);
+}

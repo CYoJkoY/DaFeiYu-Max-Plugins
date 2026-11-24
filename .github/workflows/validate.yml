@@ -19,12 +19,5 @@ jobs:
           version: 0.17.1
       - name: Validate manifests and index
         run: node scripts/validate.ts
-      - name: Rebuild index and confirm no drift
-        run: node scripts/build-index.ts
-      - name: Fail on index drift
-        shell: bash
-        run: |
-          if ! git diff --exit-code -- index.json; then
-            echo "::error::index.json 与仓库内容不一致，请先运行 node scripts/build-index.ts 提交。"
-            exit 1
-          fi
+      - name: Confirm index.json matches the modules
+        run: node scripts/build-index.ts --check

@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
   "id": "douyin-scroll",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "kind": "script",
   "name": "刷抖音",
   "labels": { "zh": "刷抖音", "en": "Douyin Scroller" },
-  "description": "通过本机桥接读取抖音推荐流，按兴趣挑一条念给桌宠听，绝不自动发送任何内容。",
+  "description": "通过本机桥接读取抖音推荐流与评论，按兴趣挑一条念给桌宠听；点赞、收藏、评论、回复默认关闭，开启后也必须通过插件内置守门。",
   "author": "CYoJkoY",
   "homepage": "https://github.com/CYoJkoY/DaFeiYu-Max-Plugins",
   "tags": ["抖音", "推荐流", "桥接"],
@@ -34,8 +34,48 @@
         "type": "boolean",
         "label": "优先推送兴趣关键词",
         "default": true
+      },
+      {
+        "id": "allowWrites",
+        "type": "boolean",
+        "label": "允许写入（点赞 / 收藏 / 评论 / 回复）",
+        "default": false
+      },
+      {
+        "id": "autoFavorite",
+        "type": "boolean",
+        "label": "命中兴趣时自动收藏",
+        "default": false
+      },
+      {
+        "id": "commentText",
+        "type": "text",
+        "label": "评论原文",
+        "placeholder": "你自己写的评论，插件只发这一句"
+      },
+      {
+        "id": "replyText",
+        "type": "text",
+        "label": "回复原文",
+        "placeholder": "你自己写的回复，插件只发这一句"
+      },
+      {
+        "id": "dailyWriteLimit",
+        "type": "number",
+        "label": "每日写入上限（次）",
+        "default": 5,
+        "min": 1,
+        "max": 50
+      },
+      {
+        "id": "writeCooldownSeconds",
+        "type": "number",
+        "label": "写入冷却（秒）",
+        "default": 60,
+        "min": 10,
+        "max": 600
       }
     ],
-    "commands": ["next", "reset", "stats"]
+    "commands": ["next", "reset", "stats", "like", "favorite", "comment", "reply"]
   }
 }

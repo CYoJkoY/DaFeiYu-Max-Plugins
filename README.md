@@ -26,6 +26,8 @@ plugins/<id>/plugin.wasm    编译产物（与清单 script.entry 同名）
 schema/index.schema.json    市场索引 JSON Schema
 scripts/validate.ts         校验清单、模块与索引一致性
 scripts/build-index.ts      按现有模块重算 size / sha256 并重建 index.json
+scripts/build-plugin.ts     用 Zig 重编译并比对（--write 刷新模块）
+scripts/test-plugin.ts      把编好的模块放进 Node 的 WASM 运行时跑确定性测试
 ```
 
 ## 如何发布一个插件
@@ -65,6 +67,20 @@ node tools/bridge.ts --port 8766 --feed D:/我的数据.json
 不登录抖音、不抓取、不上传。把主应用里的「桥接地址」填成同一个地址，插件就会
 从这份数据里按兴趣挑一条念给你听。想接真实数据源，就替换这个进程——只要
 `/feed` 的返回形状不变。
+
+推荐流里可以带 `comments`（含 `replies`），插件会挑一条热念念出来。若在设置里
+打开「允许写入」，插件还会向上表的 `POST /like`、`/favorite`、`/comment`、
+`/reply` 发请求；示例桥接只把它们记在内存里，用 `GET /log` 查看。写操作在插件
+内部有强制守门（详见 `plugins/douyin-scroll/README.md`）。
+
+## 测试
+
+```sh
+node scripts/test-plugin.ts
+```
+
+它不起服务、不联网：把 `plugins/douyin-scroll/plugin.wasm` 实例化到 Node 自带的
+WebAssembly 运行时里，用假宿主喂事件、读回包，断言写操作守门与文本清洗的行为。
 
 ## 两条红线
 

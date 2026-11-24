@@ -1,8 +1,42 @@
 {
   "items": [
-    { "id": "d-1001", "title": "Zig 写插件真香", "author": "某鱼", "url": "https://www.douyin.com/", "hot": 1200 },
-    { "id": "d-1002", "title": "DeepSeek 新模型上手", "author": "模型观察", "url": "https://www.douyin.com/", "hot": 76000 },
-    { "id": "d-1003", "title": "手工编织的小鱼挂件", "author": "织织", "url": "https://www.douyin.com/", "hot": 5400 },
-    { "id": "d-1004", "title": "今天也在认真吃饭", "author": "干饭人", "url": "https://www.douyin.com/", "hot": 2100000 }
+    {
+      "id": "d-1001",
+      "title": "Zig 写插件真香",
+      "author": "某鱼",
+      "url": "https://www.douyin.com/",
+      "hot": 1200,
+      "comments": [
+        { "id": "c-1001", "author": "沙箱研究所", "text": "编译参数那四个 --export 是真的容易漏", "likes": 312 },
+        { "id": "c-1002", "author": "路过", "text": "看完就去写一个", "likes": 18, "replies": [ { "id": "r-1001", "author": "某鱼", "text": "等你交作业" } ] }
+      ]
+    },
+    {
+      "id": "d-1002",
+      "title": "DeepSeek 新模型上手",
+      "author": "模型观察",
+      "url": "https://www.douyin.com/",
+      "hot": 76000,
+      "comments": [
+        { "id": "c-2001", "author": "调参侠", "text": "长上下文还是得看注意力有没有跑偏", "likes": 208 }
+      ]
+    },
+    {
+      "id": "d-1003",
+      "title": "手工编织的小鱼挂件",
+      "author": "织织",
+      "url": "https://www.douyin.com/",
+      "hot": 5400,
+      "comments": [
+        { "id": "c-3001", "author": "手残党", "text": "这个配色太好看了", "likes": 96 }
+      ]
+    },
+    {
+      "id": "d-1004",
+      "title": "今天也在认真吃饭",
+      "author": "干饭人",
+      "url": "https://www.douyin.com/",
+      "hot": 2100000
+    }
   ]
 }

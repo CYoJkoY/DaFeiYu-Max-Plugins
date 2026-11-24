@@ -440,6 +440,7 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
     const boost = dfy.getBool(options, "interestBoost") orelse true;
     const allow_writes = dfy.getBool(options, "allowWrites") orelse false;
     const auto_favorite = dfy.getBool(options, "autoFavorite") orelse false;
+    const auto_reply = dfy.getBool(options, "autoReply") orelse false;
     const daily_limit = clampInt(
         dfy.getInt(options, "dailyWriteLimit") orelse 5,
         Guard.daily_min,
@@ -739,6 +740,9 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
         try reply.stateStr("lastAuthor", author);
         if (isHttpsUrl(url)) try reply.stateStr("lastUrl", url);
 
+        // The one id an autonomous reply may use, taken from this very fetch.
+        var auto_reply_target: []const u8 = "";
+
         // Provenance for later writes: only ids the bridge actually returned.
         if (best_comment) |comment| {
             const comment_id = dfy.getStr(comment, "id") orelse "";
@@ -757,6 +761,7 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
             try reply.stateStr("lastCommentId", comment_id);
             try reply.stateStr("lastCommentAuthor", comment_author);
             if (comment_text.len > 0) try reply.stateStr("lastCommentText", comment_text);
+            if (validId(comment_id)) auto_reply_target = comment_id;
 
             const replies = dfy.getList(comment, "replies");
             var chosen_reply: ?dfy.Value = null;
@@ -777,6 +782,7 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
                 );
                 try reply.stateStr("lastReplyId", reply_id);
                 if (reply_text.len > 0) try reply.stateStr("lastReplyText", reply_text);
+                if (validId(reply_id)) auto_reply_target = reply_id;
             } else {
                 try reply.stateRemove("lastReplyId");
                 try reply.stateRemove("lastReplyText");
@@ -791,9 +797,39 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
 
         reply.status(line, null, counter + 1);
 
-        // 自主收藏：只有命中兴趣的视频才配自动收藏，而且仍要过守门。
-        // 注意目标 id 与文本都来自 state / 设置，feed 文本到这里只是被念了一句。
-        if (auto_favorite and allow_writes and best_score >= Guard.auto_interest_score) {
+        // 自主写入：一条视频最多一条，回复优先于收藏。
+        // 目标 id 与正文都来自本次抓取的 id 与设置；feed 文本到这里只是被念了一句。
+        var wrote_this_round = false;
+
+        const auto_reply_wanted = auto_reply
+            and allow_writes
+            and user_reply.len > 0
+            and best_comment != null
+            and best_comment_score >= Guard.auto_interest_score;
+        if (auto_reply_wanted) {
+            const refusal = writeRefusal(.{
+                .allow = allow_writes,
+                .target_from_feed = validId(auto_reply_target),
+                .needs_text = true,
+                .text_len = user_reply.len,
+                .cooldown_ms = cooldown_ms,
+                .daily_limit = daily_limit,
+                .now = ctx.now,
+                .last_write_at = dfy.getInt(ctx.state, "lastWriteAt") orelse 0,
+                .writes_today = writesToday(ctx.state, ctx.now),
+            });
+            // Same guard as the commands: a refusal here is silent, because the
+            // user did not press anything.
+            if (refusal == null) {
+                if (try emitWrite(reply, .reply, bridge, auto_reply_target, user_reply)) {
+                    wrote_this_round = true;
+                } else {
+                    reply.status("自动回复没发出去", null, counter + 1);
+                }
+            }
+        }
+
+        if (!wrote_this_round and auto_favorite and allow_writes and best_score >= Guard.auto_interest_score) {
             const refusal = writeRefusal(.{
                 .allow = allow_writes,
                 .target_from_feed = validId(item_id),
@@ -805,8 +841,6 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
                 .last_write_at = dfy.getInt(ctx.state, "lastWriteAt") orelse 0,
                 .writes_today = writesToday(ctx.state, ctx.now),
             });
-            // Same guard as the commands: a refusal here is silent, because the
-            // user did not press anything.
             if (refusal == null) {
                 if (!try emitWrite(reply, .favorite, bridge, item_id, "")) {
                     reply.status("自动收藏没发出去", null, counter + 1);

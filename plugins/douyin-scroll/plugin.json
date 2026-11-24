@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "douyin-scroll",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "kind": "script",
   "name": "刷抖音",
   "labels": { "zh": "刷抖音", "en": "Douyin Scroller" },
@@ -45,6 +45,12 @@
         "id": "autoFavorite",
         "type": "boolean",
         "label": "命中兴趣时自动收藏",
+        "default": false
+      },
+      {
+        "id": "autoReply",
+        "type": "boolean",
+        "label": "命中兴趣的评论自动回复",
         "default": false
       },
       {

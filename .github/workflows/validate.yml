@@ -21,5 +21,7 @@ jobs:
         run: node scripts/validate.ts
       - name: Rebuild every plug-in from source and compare
         run: node scripts/build-plugin.ts --check
+      - name: Run the plug-in tests
+        run: node scripts/test-plugin.ts
       - name: Confirm index.json matches the modules
         run: node scripts/build-index.ts --check

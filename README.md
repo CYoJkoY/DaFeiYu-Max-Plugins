@@ -42,9 +42,15 @@ scripts/build-index.ts      按现有模块重算 size / sha256 并重建 index.
    ```
 
    产物重命名为 `plugin.wasm`，放在 `plugins/<id>/` 下（与 `script.entry` 一致）。
+   也可以直接运行 `node scripts/build-plugin.ts --write`，它会按同样的参数编译
+   每个 `src/main.zig` 并覆盖对应的 `plugin.wasm`。
 4. 写 `plugin.json`，声明 `kind: "script"`、`permissions`、`settings`、`commands`。
 5. 运行 `node scripts/validate.ts` 确认本地一致。
 6. 运行 `node scripts/build-index.ts` 重建 `index.json`，提交并推送。
+
+CI 除了校验清单与索引，还会用 Zig 0.17.1 把每个 `src/main.zig` 重新编译一遍，
+要求结果与提交的 `plugin.wasm` 逐字节相同。源码和模块不同步会直接失败，
+避免市场里出现「源码是一套、跑的是另一套」的模块。
 
 ## 本地试跑（刷抖音）
 

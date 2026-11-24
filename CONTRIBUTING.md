@@ -38,10 +38,15 @@ zig build-exe -O ReleaseSmall -target wasm32-freestanding -fno-entry \
 
 ```sh
 node scripts/validate.ts     # 清单、模块、哈希与索引一致
+node scripts/build-plugin.ts --check  # 源码重编译后必须与 plugin.wasm 逐字节一致
 node scripts/build-index.ts  # 重算 size / sha256 并写回 index.json
 ```
 
-两条都通过后再提交 `index.json`。CI 也会跑同样的检查。
+三条都通过后再提交 `index.json`。CI 也会跑同样的检查。
+
+改完 `src/main.zig` 不想手抄编译参数时，直接运行
+`node scripts/build-plugin.ts --write`：它用与主应用完全相同的参数逐个编译
+`src/main.zig` 并覆盖 `plugin.wasm`，之后照常重建索引即可。
 
 ## 红线
 

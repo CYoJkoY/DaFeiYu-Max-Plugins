@@ -51,7 +51,7 @@ scripts/build-index.ts      按现有模块重算 size / sha256 并重建 index.
 `plugins/douyin-scroll` 需要一份本机桥接数据。仓库自带一个零依赖示例：
 
 ```sh
-node tools/bridge.ts            # http://127.0.0.1:8765，读 tools/feed.json
+node tools/bridge.ts            # http://127.0.0.1:8787，读 tools/feed.json
 node tools/bridge.ts --port 8766 --feed D:/我的数据.json
 ```
 

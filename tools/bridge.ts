@@ -2,7 +2,7 @@
  * 本机桥接示例：把一份抖音推荐流喂给「刷抖音」插件。
  *
  *   node tools/bridge.ts                  # 用 tools/feed.json，缺省时用内置示例
- *   node tools/bridge.ts --port 8765      # 换端口
+ *   node tools/bridge.ts --port 8787      # 换端口
  *   node tools/bridge.ts --feed D:/x.json # 指向你自己的数据
  *
  * 端点：
@@ -42,7 +42,7 @@ function argument(name: string, fallback: string): string {
   return value && !value.startsWith('--') ? value : fallback;
 }
 
-const port = Number(argument('port', process.env.DFY_BRIDGE_PORT ?? '8765'));
+const port = Number(argument('port', process.env.DFY_BRIDGE_PORT ?? '8787'));
 const feedPath = argument('feed', join(import.meta.dirname, 'feed.json'));
 
 /** 读一次 feed 文件；缺字段的条目丢掉，`url` 不是 https 的也丢掉。 */

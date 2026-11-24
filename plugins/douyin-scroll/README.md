@@ -22,14 +22,14 @@
 仓库自带的 `tools/bridge.ts` 就是一份可直接运行的示例：
 
 ```sh
-node tools/bridge.ts            # http://127.0.0.1:8765，读 tools/feed.json
+node tools/bridge.ts            # http://127.0.0.1:8787，读 tools/feed.json
 ```
 
 ## 设置项
 
 | id | 类型 | 说明 |
 | --- | --- | --- |
-| `bridgeUrl` | url | 桥接地址，例如 `http://127.0.0.1:8765` |
+| `bridgeUrl` | url | 桥接地址，例如 `http://127.0.0.1:8787` |
 | `intervalSeconds` | number | 刷新间隔，5–300 秒，默认 20 |
 | `interestBoost` | boolean | 是否优先推送命中兴趣关键词的内容，默认开 |
 

@@ -19,7 +19,7 @@
         "id": "bridgeUrl",
         "type": "url",
         "label": "抖音桥接地址",
-        "placeholder": "http://127.0.0.1:8765"
+        "placeholder": "http://127.0.0.1:8787"
       },
       {
         "id": "intervalSeconds",

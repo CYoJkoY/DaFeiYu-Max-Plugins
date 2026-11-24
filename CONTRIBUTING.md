@@ -39,6 +39,7 @@ zig build-exe -O ReleaseSmall -target wasm32-freestanding -fno-entry \
 ```sh
 node scripts/validate.ts     # 清单、模块、哈希与索引一致
 node scripts/build-plugin.ts --check  # 源码重编译后必须与 plugin.wasm 逐字节一致
+node scripts/test-plugin.ts  # 用 Node 的 WASM 运行时跑插件的确定性测试
 node scripts/build-index.ts  # 重算 size / sha256 并写回 index.json
 ```
 
@@ -53,3 +54,7 @@ node scripts/build-index.ts  # 重算 size / sha256 并写回 index.json
 - 只声明真正需要的权限，能不用 `net` 就不用。
 - 不收集、不上传用户数据。
 - 不承诺主应用没有实现的行为；插件不能自己联网、自己点开窗口或自动发送内容。
+- 任何会**向外写**内容的功能（评论、回复、点赞、收藏）都必须有一条插件内部的
+  守门：写操作只能由用户显式命令或明确开启的开关触发，目标必须来自插件自己
+  上一次抓取到的 id，正文只能来自用户手写原文。桥接文本永远不能决定写什么、
+  写给谁。改完请补上 `scripts/test-plugin.ts` 里对应的注入用例。

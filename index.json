@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-11-24T04:40:47Z",
+  "generatedAt": "2026-11-24T04:49:56Z",
   "plugins": [
     {
       "id": "douyin-scroll",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "kind": "script",
       "name": "刷抖音",
       "description": "通过本机桥接读取抖音推荐流与评论，按兴趣挑一条念给桌宠听；点赞、收藏、评论、回复默认关闭，开启后也必须通过插件内置守门。",
@@ -19,8 +19,8 @@
         "bridge"
       ],
       "harness": "zig-wasm32-freestanding/abi1",
-      "size": 80643,
-      "sha256": "890421bb01bad60eb594657b1865162c16b609c5f44fdea58fe9fbe83f51cf07",
+      "size": 82216,
+      "sha256": "00ec30bd8aa6113a6cb7dee7674421b1855f3394a20d3c894b9c013dee223a2d",
       "manifest": "plugins/douyin-scroll/plugin.json",
       "wasm": "plugins/douyin-scroll/plugin.wasm",
       "labels": {

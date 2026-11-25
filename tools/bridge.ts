@@ -14,6 +14,7 @@
  * 写端点（只有插件在守门放行时才会调到这里）：
  *   POST /like      { "id": "..." }
  *   POST /favorite  { "id": "..." }
+ *   POST /comment-like { "id": "..." }
  *   POST /comment   { "id": "...", "text": "..." }
  *   POST /reply     { "target": "...", "text": "..." }
  *
@@ -223,7 +224,7 @@ const server = createServer(async (request: IncomingMessage, response: ServerRes
 
   if (request.method === 'POST') {
     const action = url.pathname.replace(/^\//, '');
-    if (!['like', 'favorite', 'comment', 'reply'].includes(action)) {
+    if (!['like', 'favorite', 'comment-like', 'comment', 'reply'].includes(action)) {
       send(404, { ok: false, error: '未知端点' });
       return;
     }

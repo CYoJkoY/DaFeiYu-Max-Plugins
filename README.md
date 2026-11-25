@@ -1,5 +1,7 @@
 # DaFeiYu-Max-Plugins
 
+<p align="center"><img src="assets/brand/plugin-icon.png" width="220" alt="DaFeiYu-Max 插件库"></p>
+
 蓝色大肥鱼（DaFeiYu）的云端插件市场仓库。主应用读取这里的 `index.json`，
 按需下载 `plugin.json` 清单与 `plugin.wasm` 模块，全部校验后才安装到本地。
 
@@ -20,15 +22,22 @@
 
 ```
 sdk/dfy.zig                 插件开发 SDK（主应用同款）
+assets/brand/plugin-icon.png  市场图标 PNG 母版
+assets/brand/plugin-icon.ico  Windows 图标（由 PNG 母版生成）
 plugins/<id>/plugin.json    声明 ABI、权限、设置项与命令
 plugins/<id>/src/main.zig   可读源码
 plugins/<id>/plugin.wasm    编译产物（与清单 script.entry 同名）
 schema/index.schema.json    市场索引 JSON Schema
+scripts/icons.ts            从 PNG 母版重新生成 ICO
+scripts/lib/png.ts          PNG 编解码、缩放与 ICO 容器（仅标准库）
 scripts/validate.ts         校验清单、模块与索引一致性
 scripts/build-index.ts      按现有模块重算 size / sha256 并重建 index.json
 scripts/build-plugin.ts     用 Zig 重编译并比对（--write 刷新模块）
 scripts/test-plugin.ts      把编好的模块放进 Node 的 WASM 运行时跑确定性测试
 ```
+
+`node scripts/icons.ts` 会从 `assets/brand/plugin-icon.png` 重新生成
+`assets/brand/plugin-icon.ico`；PNG 与 ICO 都随仓库提交。
 
 ## 如何发布一个插件
 

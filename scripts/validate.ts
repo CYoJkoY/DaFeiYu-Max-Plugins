@@ -127,6 +127,53 @@ if (!existsSync(indexPath)) {
   }
 }
 
+const brandPngPath = join(root, 'assets', 'brand', 'plugin-icon.png');
+const brandIcoPath = join(root, 'assets', 'brand', 'plugin-icon.ico');
+if (!existsSync(brandPngPath)) {
+  failures.push('缺少 assets/brand/plugin-icon.png');
+} else {
+  const png = readFileSync(brandPngPath);
+  if (png.length < 24 || png.subarray(0, 8).toString('hex') !== '89504e470d0a1a0a') {
+    failures.push('assets/brand/plugin-icon.png 不是合法 PNG');
+  } else {
+    const width = png.readUInt32BE(16);
+    const height = png.readUInt32BE(20);
+    if (width !== height || width < 256) {
+      failures.push(`assets/brand/plugin-icon.png 必须是至少 256px 的正方形（当前 ${width}x${height}）`);
+    }
+  }
+}
+if (!existsSync(brandIcoPath)) {
+  failures.push('缺少 assets/brand/plugin-icon.ico');
+} else {
+  const ico = readFileSync(brandIcoPath);
+  if (ico.length < 6 || ico.readUInt16LE(0) !== 0 || ico.readUInt16LE(2) !== 1) {
+    failures.push('assets/brand/plugin-icon.ico 不是合法 ICO');
+  } else {
+    const count = ico.readUInt16LE(4);
+    const sizes = new Set<number>();
+    for (let index = 0; index < count; index += 1) {
+      const entry = 6 + 16 * index;
+      if (entry + 16 > ico.length) {
+        failures.push('assets/brand/plugin-icon.ico 条目被截断');
+        break;
+      }
+      const width = ico.readUInt8(entry) || 256;
+      const height = ico.readUInt8(entry + 1) || 256;
+      const length = ico.readUInt32LE(entry + 8);
+      const offset = ico.readUInt32LE(entry + 12);
+      if (width !== height || offset + length > ico.length) {
+        failures.push(`assets/brand/plugin-icon.ico 含损坏的 ${width}x${height} 条目`);
+        break;
+      }
+      sizes.add(width);
+    }
+    for (const size of [16, 32, 48, 256]) {
+      if (!sizes.has(size)) failures.push(`assets/brand/plugin-icon.ico 缺少 ${size}px 条目`);
+    }
+  }
+}
+
 if (failures.length) {
   console.error(`校验失败（${failures.length} 个问题）：`);
   for (const failure of failures) console.error(`  - ${failure}`);

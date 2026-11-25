@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "douyin-scroll",
-  "version": "0.4.1",
+  "version": "0.4.3",
   "kind": "script",
   "name": "刷抖音",
   "labels": { "zh": "刷抖音", "en": "Douyin Scroller" },
@@ -68,7 +68,7 @@
       {
         "id": "dailyWriteLimit",
         "type": "number",
-        "label": "每日写入上限（次）",
+        "label": "每日写入额度（次）",
         "default": 5,
         "min": 1,
         "max": 50

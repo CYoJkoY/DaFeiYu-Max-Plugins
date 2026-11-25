@@ -8,12 +8,18 @@
 //! ## 强制守门（这里写死，用户关不掉）
 //!
 //! 推荐流、评论、回复全部是陌生人写的文本。它们可以进入桌宠嘴里，但**永远
-//! 不能变成动作**：不能决定写什么、写给谁、写不写。写请求只有一条合法路径：
+//! 不能变成动作**：不能决定写什么、写给谁。写请求只有一条合法路径：
 //!
-//!   `command`（或明确开启的自动收藏） → `writeGate` 通过 → 用户手写原文。
+//!   `command`（或明确开启的自动收藏 / 自动回复） → `writeRefusal` 通过 → 发出请求
+//!   （正文只可能是用户手写原文；`like` / `favorite` / `comment-like` 不带正文）。
 //!
-//! 守门规则见 `WriteContext`：开关、目标来源、文本来源、冷却、每日上限。
-//! 只要有一项不满足就拒绝，并且拒绝理由会念给用户听，不做静默降级。
+//! 守门规则见 `WriteContext`：开关、目标格式 / 来源证明 / 可疑标记、正文非空（来源
+//! 由调用点保证）、在途写入、每日写入额度（含顶替预留）、冷却。
+//! 只要有一项不满足就拒绝。命令路径会把拒绝理由念给用户听——按钮是你按的，
+//! 你得知道为什么没动静；自动路径按设计静默拒绝，`tick` 抓回来的一句话不该
+//! 替你在桌面上嚷「每日写入额度用完了」。唯一的例外是「写入序号用尽」：那
+//! 不是「这一条不该写」，而是插件的写入账本坏了，恢复动作必须说出来，所以
+//! 自动路径也只念这一条。两条路径共用同一份守门，没有哪条能绕过去。
 //!
 //! ## 提示词注入的两道防线
 //!
@@ -81,11 +87,203 @@ const Guard = struct {
     const max_error: usize = 60;
     const daily_min: i64 = 1;
     const daily_max: i64 = 50;
+    // `_s` 是设置项里的秒数上下限，`_ms` 是内部按毫秒算的时长；两者别相加。
     const cooldown_min_s: i64 = 10;
     const cooldown_max_s: i64 = 600;
+    /// 写入发出后等回执的上限；超时视为回执丢失，解除在途拦截，免得一次
+    /// 丢包把写入永久锁死。冷却照常生效，所以超时后的重试仍可能被冷却拦住。
+    /// 这个窗口只管在途：时钟回拨（当前时间早于发出时间）不去判过期，而是
+    /// 由 `settleClock` 把时间戳重锚到当前时间，并按在途继续拦住——最多让
+    /// 用户多等一个窗口。时钟往前跳超过这个窗口只是让在途放行，冷却按自己的
+    /// `cooldown_ms` 独立计算（配到 600 秒时比这个窗口长），所以前跳 130 秒、
+    /// 冷却 600 秒时在途已过期、冷却仍然拦得住。
+    const in_flight_timeout_ms: i64 = 120_000;
     /// 自动收藏只认「命中兴趣」的视频，热度高不算。
     const auto_interest_score: f64 = 2_000;
+    /// 超时重试时被顶替的旧 token 名单上限。名单只用于事后识别回执并播报
+    /// 结果；每日写入额度在被顶替那一刻就计数，所以名单再丢也不会放宽封顶。
+    const stale_write_max: usize = 3;
 };
+
+/// 被后续写入顶替的旧 token 名单：有界，最旧的先丢。每日写入额度在被顶替时
+/// 先记一笔（宁可高估），迟到回执只用来向用户确认结果，不参与计数。
+const StaleWrites = struct {
+    const max_entries: usize = Guard.stale_write_max;
+    const max_token: usize = 40;
+    const capacity: usize = max_entries * max_token + 8;
+
+    entries: [max_entries][max_token]u8 = undefined,
+    lens: [max_entries]usize = undefined,
+    count: usize = 0,
+
+    const empty = StaleWrites{};
+
+    /// Parse persisted stale-token text. Unknown or malformed items are
+    /// dropped so corrupt state cannot revive a growing list.
+    fn parse(saved: []const u8) StaleWrites {
+        var list = StaleWrites.empty;
+        var remaining = std.mem.splitScalar(u8, saved, ',');
+        while (remaining.next()) |entry| {
+            // 名单只收写回执 token：手改出的 `feed` 之类会在 `settle` 里按 id
+            // 全等匹配到抓取回执，被当成「超时写入确认成功」并吞掉同批推荐。
+            // 可用性校验、去重与「满了丢最旧」都由 `append` 负责，两处共用一套
+            // 规则，免得落盘名单与内存名单哪天改岔。
+            _ = list.append(entry);
+        }
+        return list;
+    }
+
+    fn contains(self: StaleWrites, token: []const u8) bool {
+        var index: usize = 0;
+        while (index < self.count) : (index += 1) {
+            if (std.mem.eql(u8, self.entries[index][0..self.lens[index]], token)) return true;
+        }
+        return false;
+    }
+
+    /// Append `token`, dropping the oldest entry when the list is full.
+    /// Returns false when the token is unusable or already listed, so the
+    /// caller only counts a write it has not already counted.
+    fn append(self: *StaleWrites, token: []const u8) bool {
+        if (!usableToken(token) or self.contains(token)) return false;
+        if (self.count == max_entries) self.dropOldest();
+        @memcpy(self.entries[self.count][0..token.len], token);
+        self.lens[self.count] = token.len;
+        self.count += 1;
+        return true;
+    }
+
+    fn dropOldest(self: *StaleWrites) void {
+        self.removeAt(0);
+    }
+
+    /// 名单里最大的序号。新 token 必须大于它，否则名单上的旧 token 会被
+    /// 复用，重投的旧回执就能冒充新写入（名单是持久状态，可被手改）。
+    fn maxSequence(self: StaleWrites) ?i64 {
+        var max: ?i64 = null;
+        var index: usize = 0;
+        while (index < self.count) : (index += 1) {
+            const seq = tokenSequence(self.entries[index][0..self.lens[index]]) orelse continue;
+            if (max == null or seq > max.?) max = seq;
+        }
+        return max;
+    }
+
+    fn removeAt(self: *StaleWrites, index: usize) void {
+        var at = index;
+        while (at + 1 < self.count) : (at += 1) {
+            self.entries[at] = self.entries[at + 1];
+            self.lens[at] = self.lens[at + 1];
+        }
+        self.count -= 1;
+    }
+
+    /// Settle every stale token that has a receipt in this result batch.
+    /// Successes are already reflected in `writesToday`; this only reports
+    /// what happened and keeps unmatched tokens for later confirmation.
+    fn settle(self: *StaleWrites, results: []const dfy.Value) StaleSettlement {
+        var settlement = StaleSettlement{};
+        var index: usize = 0;
+        while (index < self.count) {
+            const entry = self.entries[index][0..self.lens[index]];
+            var matched = false;
+            for (results) |result| {
+                if (result != .object) continue;
+                const id = dfy.getStr(result, "id") orelse continue;
+                if (!dfy.eql(id, entry)) continue;
+                matched = true;
+                // 缺 `ok` 的回执说不清成败：既不按成功也不按失败，只从名单
+                // 摘掉并如实告诉用户「无法确认」，不替桥接编造结论。
+                if (dfy.getBool(result, "ok")) |ok| {
+                    if (ok) {
+                        settlement.succeeded += 1;
+                    } else {
+                        settlement.failed += 1;
+                    }
+                } else {
+                    settlement.unconfirmed += 1;
+                }
+                settlement.changed = true;
+                self.removeAt(index);
+                break;
+            }
+            if (!matched) index += 1;
+        }
+        return settlement;
+    }
+
+    fn save(self: StaleWrites, reply: *dfy.Reply) !void {
+        if (self.count == 0) {
+            try reply.stateRemove("staleWrites");
+            return;
+        }
+        var buffer: [capacity]u8 = undefined;
+        var at: usize = 0;
+        var index: usize = 0;
+        while (index < self.count) : (index += 1) {
+            if (at + self.lens[index] + 1 > buffer.len) break;
+            if (at > 0) {
+                buffer[at] = ',';
+                at += 1;
+            }
+            @memcpy(buffer[at..][0..self.lens[index]], self.entries[index][0..self.lens[index]]);
+            at += self.lens[index];
+        }
+        try reply.stateStr("staleWrites", buffer[0..at]);
+    }
+};
+
+pub const StaleSettlement = struct {
+    /// 回执确认成功的笔数。被顶替那一刻已经记过一笔，所以它只用于播报。
+    succeeded: i64 = 0,
+    failed: i64 = 0,
+    /// 回执在但读不出 `ok` 的条目：只摘名单，不下结论。
+    unconfirmed: i64 = 0,
+    /// 这次结算是否真的动过名单，决定要不要落盘（没动就不写）。
+    changed: bool = false,
+};
+
+/// A receipt may settle stale writes and a new write may replace the current
+/// in-flight slot in the same event. `ctx.state` stays stale until the host
+/// merges the reply, so this event-local list is the only source of truth
+/// while the handler runs.
+threadlocal var round_stale = StaleWrites.empty;
+
+/// 本次事件已经发出几笔写入。守门与调用链本来只允许一笔，这里再钉一道：
+/// 万一以后有人加了第二条写入路径，也不会在同一轮里把同一个旧 token
+/// 重复顶替、重复计入每日写入额度。
+threadlocal var writes_this_event: u32 = 0;
+
+/// 从写入 token（`write:<动作>:<序号>`）里读回序号；读不出返回 null。
+/// 用于 `writeSeq` 被写坏时兜底，避免新 token 与仍在途的那一笔撞号。
+///
+/// 位数上限必须覆盖 `emitWrite` 能写出的全部序号：`i64` 上限是 19 位，
+/// `emitWrite` 只在 `seq >= maxInt(i64)` 时拒绝，所以最后一笔合法 token 可能是
+/// 19 位。上限若收得比它紧，这笔回执就会被判成「认不出动作」——成功不计数、
+/// 每日封顶静默失效，而状态本身看起来完全合法。超范围仍由 `parseInt` 的
+/// overflow 兜住。
+fn tokenSequence(token: []const u8) ?i64 {
+    const at = std.mem.lastIndexOfScalar(u8, token, ':') orelse return null;
+    const digits = token[at + 1 ..];
+    if (digits.len == 0 or digits.len > 19) return null;
+    for (digits) |c| {
+        if (c < '0' or c > '9') return null;
+    }
+    return std.fmt.parseInt(i64, digits, 10) catch null;
+}
+
+/// 只有写回执形状、且动作名认得出的字符串才允许进超时名单。名单项会被拿去和
+/// 回执 id 全等比较，收进 `feed` 这类 id 就会把抓取回执当成写入回执处理；
+/// 动作认不出的 token（`write:`、`write:x:1`）进名单也没法在结算时说明是哪
+/// 种写入，所以同样不收——它若占着 `pendingWrite`，被顶替时照样计数（见
+/// `emitWrite` 里那一段）。带 `,` 的 token 也不收：名单用逗号拼成一串落盘，
+/// 收进来会在下一次读回时被拆成两条，内存名单与落盘名单就对不上了。
+fn usableToken(token: []const u8) bool {
+    return token.len > 0
+        and token.len <= StaleWrites.max_token
+        and std.mem.indexOfScalar(u8, token, ',') == null
+        and kindFromToken(token) != null;
+}
 
 fn isString(item: dfy.Value) bool {
     return item == .string;
@@ -319,13 +517,14 @@ const WriteKind = enum {
         };
     }
 
-    fn effectId(self: WriteKind) []const u8 {
+    /// 回执 id 里的动作段，也是 `parseWriteKind` 认识的唯一写法。
+    fn actionName(self: WriteKind) []const u8 {
         return switch (self) {
-            .like => "write:like",
-            .favorite => "write:favorite",
-            .comment => "write:comment",
-            .reply => "write:reply",
-            .comment_like => "write:comment-like",
+            .like => "like",
+            .favorite => "favorite",
+            .comment => "comment",
+            .reply => "reply",
+            .comment_like => "comment-like",
         };
     }
 
@@ -360,13 +559,34 @@ fn parseWriteKind(name: []const u8) ?WriteKind {
     return null;
 }
 
-fn kindFromEffectId(id: []const u8) ?WriteKind {
-    if (dfy.eql(id, "write:like")) return .like;
-    if (dfy.eql(id, "write:favorite")) return .favorite;
-    if (dfy.eql(id, "write:comment")) return .comment;
-    if (dfy.eql(id, "write:reply")) return .reply;
-    if (dfy.eql(id, "write:comment-like")) return .comment_like;
-    return null;
+/// 写回执 id 形如 `write:<kind>:<seq>`。只解析前缀与第一段动作名，
+/// 序号不参与种类判断——认出动作是为了念对一句话，不是为了确认归属；
+/// 归属只认和 `pendingWrite` 全等（见 `findWriteReceipt`）。
+fn kindFromToken(id: []const u8) ?WriteKind {
+    if (!std.mem.startsWith(u8, id, "write:")) return null;
+    const rest = id["write:".len..];
+    const name = if (std.mem.indexOfScalar(u8, rest, ':')) |at| blk: {
+        // 新 token 必须带十进制序号；旧版的 `write:<action>` 仍保留兼容。
+        if (tokenSequence(id) == null) return null;
+        break :blk rest[0..at];
+    } else rest;
+    return parseWriteKind(name);
+}
+
+/// 回执列表里是否出现过任何写回执（不论归属、不论认不认识）。
+fn hasWriteReceipt(results: []const dfy.Value) bool {
+    for (results) |entry| {
+        if (entry != .object) continue;
+        const id = dfy.getStr(entry, "id") orelse continue;
+        if (std.mem.startsWith(u8, id, "write:")) return true;
+    }
+    return false;
+}
+
+fn settleStaleWrites(reply: *dfy.Reply, results: []const dfy.Value) !StaleSettlement {
+    const settlement = round_stale.settle(results);
+    if (settlement.changed) try round_stale.save(reply);
+    return settlement;
 }
 
 /// Everything the guard is allowed to look at. Every field is either a fixed
@@ -382,15 +602,21 @@ const WriteContext = struct {
     target_len: usize,
     needs_text: bool,
     text_len: usize,
+    /// 上一笔写入已经发出、回执还没回来，而且还没到超时。
+    in_flight: bool,
     cooldown_ms: i64,
     daily_limit: i64,
     now: i64,
     last_write_at: i64,
     writes_today: i64,
+    /// 当前请求会顶替一笔已超时但尚未结算的写入。旧账与新账都要
+    /// 预留额度，避免「先顶替计一笔，再立刻发一笔」越过上限。
+    replaces_in_flight: bool,
 };
 
 /// The guard. Returns null when the write may go out, otherwise the reason it
-/// must not - which is always shown to the user, never swallowed.
+/// must not. The command path shows that reason to the user; the automatic path
+/// stays silent by design, except for the sequence-exhausted case.
 fn writeRefusal(ctx: WriteContext) ?[]const u8 {
     if (!ctx.allow) return "写操作总开关是关的，先设置里勾「允许写入」";
     if (ctx.target_len == 0) return "还没有选中目标，先 browse / pick 选一条视频";
@@ -398,8 +624,24 @@ fn writeRefusal(ctx: WriteContext) ?[]const u8 {
     if (!ctx.target_proven) return "选中的目标不在最近一次抓取里，重新刷一次再选";
     if (ctx.target_suspect) return "目标内容被标记为可疑，守门已拒绝写入";
     if (ctx.needs_text and ctx.text_len == 0) return "设置里还没写要发送的原文";
-    if (ctx.writes_today >= ctx.daily_limit) return "今天的写入次数用完了";
-    if (ctx.last_write_at > 0 and ctx.now - ctx.last_write_at < ctx.cooldown_ms) return "写入冷却中，晚点再试";
+    // 坏状态下这条可能永远成立：`inFlightState` 对「`writeInFlight` 非 0 却没有
+    // 可用时间戳」也判在途，那种状态不会超时；`pendingWrite` 也为空时，更没有
+    // token 能让回执清掉它。所以除了等回执，必须同时说出唯一的人工出口。
+    if (ctx.in_flight) return "上一笔写入还没回执（等它回来，或执行 reset 重来）";
+    if (ctx.writes_today >= ctx.daily_limit) return "每日写入额度用完了";
+    if (ctx.replaces_in_flight and ctx.writes_today + 2 > ctx.daily_limit) {
+        // 这里 `writes_today` 可能还是 0（旧账要到顶替那一刻才计），说「用完」
+        // 会让人以为额度已经被别人占光。如实说成「剩下的额度不够」。
+        // 这一支拒绝后状态一动不动，旧的在途槽也还在，所以要说清唯一出口，
+        // 否则额度卡在 `daily_limit - 1` 的用户会以为只能等到明天。
+        return "今天剩下的每日写入额度不够再发一笔（超时那笔也要先占额度）；等它的回执，或执行 reset 重来";
+    }
+    // 时钟回拨时 `settleClock` 会把持久化里的 `lastWriteAt` 重锚到当前时间，
+    // 但那次重锚要等宿主合并 state 之后才对下一次事件生效；本事件读到的仍是
+    // 未来值，差值因此为负，比较结果天然为真，按冷却拦住而不是放行。
+    if (ctx.last_write_at > 0 and ctx.now - ctx.last_write_at < ctx.cooldown_ms) {
+        return "写入冷却中，晚点再试";
+    }
     return null;
 }
 
@@ -412,8 +654,176 @@ fn dayOf(now: i64) i64 {
 fn writesToday(state: dfy.Value, now: i64) i64 {
     const day = dayOf(now);
     const saved_day = dfy.getInt(state, "writeDay") orelse -1;
-    if (saved_day != day) return 0;
-    return dfy.getInt(state, "writesToday") orelse 0;
+    // 只有「日期桶比今天旧」才算换天归零。桶被写到未来（手改状态、或系统时钟
+    // 往前跳了一天以上）时一律按同日处理：宁可把额度多压到真实换天前，也不让
+    // 一次前跳当场把每日写入额度重新打开。
+    if (saved_day < day) return 0;
+    const saved = dfy.getInt(state, "writesToday") orelse 0;
+    // 两头都钳：负数会让「额度没用完」长期成立，超出上限的值再 +1 会在
+    // ReleaseSafe 下把 WASM 打成 trap、在 ReleaseFast 下回绕成负数。
+    return clampInt(saved, 0, Guard.daily_max);
+}
+
+const InFlight = struct {
+    /// 有证据表明上一笔写入还没结束。
+    active: bool,
+    /// 用来判定的时间戳落在未来（时钟回拨），需要重锚。
+    future: bool,
+};
+
+/// 写入已发出、`effect-result` 还没回来时的状态。等待上限由
+/// `Guard.in_flight_timeout_ms` 兜住：桥接永远不回话也不能把写入永久锁死，
+/// 但刚发出的一笔总会拦住下一笔。坏状态一律按在途处理，用户能用 `reset`
+/// 解卡，匹配的回执仍能按 token 清掉它：
+/// - `writeInFlight` 是非整数（字符串 `"1"`、对象、坏值）时，不依赖 `pendingWrite`
+///   就按在途处理，但仍和其它在途一样受 120 秒窗口约束；非零整数同样算在途；
+/// - `writeInFlight` 为 0、为 `null` 或缺失时（`null` 与缺失同义），
+///   只有 `pendingWrite` 非空才算在途；
+/// - 时间锚先取 `writeInFlightAt`，再退到 `lastWriteAt`，两者都没有（或为 0）
+///   就没有证据说明旧请求已经结束，继续拦住；
+/// - 锚点落在未来（时钟回拨）算仍在途，由 `settleClock` 重锚，不做「过期放行」。
+/// 0.4.1 没有 `writeInFlight`，只有 `pendingWrite` 与 `lastWriteAt`，走的就是
+/// 第二条分支。冷却有各自的回拨防护，见 `settleClock`。
+fn inFlightState(state: dfy.Value, now: i64) InFlight {
+    var flagged = false;
+    if (dfy.get(state, "writeInFlight")) |flag| {
+        flagged = switch (flag) {
+            .integer => |value| value != 0,
+            // JSON `null` 与「键不存在」同义：宿主删键时可能留下 null，
+            // 那不算「有一笔在途」的证据，交给 `pendingWrite` 去判断。
+            .null => false,
+            // 坏值没有证据说明不是 1，宁可拦住。
+            else => true,
+        };
+    }
+    if (!flagged) {
+        const legacy_pending = dfy.getStr(state, "pendingWrite") orelse "";
+        if (legacy_pending.len == 0) return .{ .active = false, .future = false };
+    }
+    var started: i64 = 0;
+    if (dfy.getInt(state, "writeInFlightAt")) |at| {
+        if (at > 0) started = at;
+    }
+    if (started <= 0) {
+        if (dfy.getInt(state, "lastWriteAt")) |at| {
+            if (at > 0) started = at;
+        }
+    }
+    if (started <= 0) return .{ .active = true, .future = false };
+    if (now < started) return .{ .active = true, .future = true };
+    return .{ .active = now - started < Guard.in_flight_timeout_ms, .future = false };
+}
+
+fn isWriteInFlight(state: dfy.Value, now: i64) bool {
+    return inFlightState(state, now).active;
+}
+
+fn replacesExpiredWrite(state: dfy.Value, now: i64) bool {
+    const pending = dfy.getStr(state, "pendingWrite") orelse return false;
+    return pending.len > 0 and !isWriteInFlight(state, now);
+}
+
+/// 把 `text` 追加到 `dest[at.*..]`；放不下返回 false，调用方退回一句短的。
+fn appendLine(dest: []u8, at: *usize, text: []const u8) bool {
+    if (at.* + text.len > dest.len) return false;
+    @memcpy(dest[at.*..][0..text.len], text);
+    at.* += text.len;
+    return true;
+}
+
+/// 往 `dest` 里追加一段「格式化失败就整句退回」的片段。`piece` 放不下时把
+/// `fits` 拉成 false，让调用方退回短句：宁可少说一句，也不能把一个已经摘出
+/// 名单的笔数悄悄吞掉。
+fn appendPiece(dest: []u8, at: *usize, piece: []u8, comptime text: []const u8, args: anytype, fits: *bool) void {
+    const part = std.fmt.bufPrint(piece, text, args) catch "";
+    if (part.len == 0) {
+        fits.* = false;
+        return;
+    }
+    fits.* = fits.* and appendLine(dest, at, part);
+}
+
+/// 迟到回执的播报：被顶替那一刻就已经记过一笔，这里只确认结果，
+/// 不再改动每日写入额度（失败也不退回，宁可高估也不放宽封顶）。
+///
+/// 那一笔记在被顶替那天的桶里，不一定是今天：跨过 UTC 换天以后，今天的
+/// `writesToday` 根本没有这笔旧账。所以措辞统一说「被顶替那天已占用一次每日写入额度」，
+/// 不说「今日次数」——否则用户对着 `stats` 的数字怎么也对不上。
+fn staleSettlementLine(buffer: []u8, settlement: StaleSettlement) []const u8 {
+    if (settlement.succeeded == 0 and settlement.failed == 0) {
+        return std.fmt.bufPrint(
+            buffer,
+            "刚才超时的 {d} 笔写入回执读不出结果，无法确认（被顶替那天已占用一次每日写入额度）。",
+            .{settlement.unconfirmed},
+        ) catch "刚才超时的旧写入回执无法确认。";
+    }
+    if (settlement.failed == 0 and settlement.unconfirmed == 0) {
+        if (settlement.succeeded == 1) {
+            return std.fmt.bufPrint(
+                buffer,
+                "刚才超时的那笔写入确认成功了（被顶替那天已占用一次每日写入额度，不重复计）。",
+                .{},
+            ) catch "刚才超时的那笔写入确认成功了。";
+        }
+        return std.fmt.bufPrint(
+            buffer,
+            "刚才超时的 {d} 笔写入确认成功了（被顶替那天都已占用一次每日写入额度，不重复计）。",
+            .{settlement.succeeded},
+        ) catch "刚才超时的旧写入确认成功了。";
+    }
+    if (settlement.succeeded == 0 and settlement.unconfirmed == 0) {
+        if (settlement.failed == 1) {
+            return std.fmt.bufPrint(
+                buffer,
+                "刚才超时的那笔写入确认失败了（被顶替那天已占用一次每日写入额度，失败也不退回）。",
+                .{},
+            ) catch "刚才超时的那笔写入确认失败了。";
+        }
+        return std.fmt.bufPrint(
+            buffer,
+            "刚才超时的 {d} 笔写入确认失败了（被顶替那天都已占用一次每日写入额度，失败也不退回）。",
+            .{settlement.failed},
+        ) catch "刚才超时的旧写入确认失败了。";
+    }
+    // 一批里成功、失败、读不出结果混在一起：只念真有数的那些。三种结果都写
+    // 死会念出「失败 0 笔」，而漏掉任何一类又会把已经摘出名单的条目悄悄吞掉。
+    var at: usize = 0;
+    var piece: [96]u8 = undefined;
+    var fits = appendLine(buffer, &at, "刚才超时的旧写入：");
+    var first = true;
+    if (settlement.succeeded > 0) {
+        appendPiece(buffer, &at, &piece, "{s}成功 {d} 笔", .{ @as([]const u8, if (first) "" else "、"), settlement.succeeded }, &fits);
+        first = false;
+    }
+    if (settlement.failed > 0) {
+        appendPiece(buffer, &at, &piece, "{s}失败 {d} 笔", .{ @as([]const u8, if (first) "" else "、"), settlement.failed }, &fits);
+        first = false;
+    }
+    if (settlement.unconfirmed > 0) {
+        appendPiece(buffer, &at, &piece, "{s}{d} 笔无法确认", .{ @as([]const u8, if (first) "" else "、"), settlement.unconfirmed }, &fits);
+    }
+    fits = fits and appendLine(buffer, &at, "（被顶替那天都已占用一次每日写入额度，成功不重复计、失败也不退回）。");
+    if (!fits) return "刚才超时的旧写入已结算。";
+    return buffer[0..at];
+}
+
+/// 时钟回拨：把落在未来的时间戳重锚到当前时间，最多让用户多等一个窗口 /
+/// 一次冷却，而不是让一次回拨把写入锁死到只能 `reset`。
+///
+/// 回执事件自己会结算在途状态（匹配的回执要 `stateRemove` 掉
+/// `writeInFlightAt`），`reset` 要删掉这两个键；这两类事件不重锚，免得
+/// 同一轮里先写后删，删除被合并逻辑吞掉。其余事件重锚一次即可，下一次
+/// `now` 正常前进后就不再触发。
+fn settleClock(ctx: *dfy.Context) !void {
+    const kind = dfy.getStr(ctx.event, "type") orelse "";
+    if (dfy.eql(kind, "effect-result")) return;
+    if (dfy.eql(kind, "command") and dfy.eql(dfy.getStr(ctx.event, "name") orelse "", "reset")) return;
+    if (inFlightState(ctx.state, ctx.now).future) {
+        try ctx.reply.stateInt("writeInFlightAt", ctx.now);
+    }
+    if (dfy.getInt(ctx.state, "lastWriteAt")) |last| {
+        if (last > 0 and ctx.now < last) try ctx.reply.stateInt("lastWriteAt", ctx.now);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -810,9 +1220,27 @@ fn handleCommand(
     cooldown_ms: i64,
     user_comment: []const u8,
     user_reply: []const u8,
+    seq: *i64,
 ) !bool {
     const reply = ctx.reply;
     if (dfy.eql(name, "reset")) {
+        // 重置是用户解卡的出口：在途槽必须清掉，否则一笔丢包就能把写入锁到
+        // 120 秒之后。代价是旧请求可能还在桥接侧跑，重置后立刻再写有可能让
+        // 同一个动作做两遍——这个代价说出来，别让用户以为重置等于取消。
+        const had_in_flight = isWriteInFlight(ctx.state, ctx.now);
+        // 序号下限必须在清理之前算：在途那一笔与超时名单里的序号都还读得到。
+        // 清完之后只剩 `writeSeq`，一旦它本身缺失或被写坏，没有这个下限就只能
+        // 从 0 起重播种，与桥接侧还没结束的旧请求撞出同一个 token，旧回执回来
+        // 就能冒充新写入。所以重播种至少写到这个下限。
+        var seq_floor: i64 = 0;
+        if (dfy.getStr(ctx.state, "pendingWrite")) |pending_token| {
+            if (tokenSequence(pending_token)) |value| {
+                if (value > seq_floor) seq_floor = value;
+            }
+        }
+        if (round_stale.maxSequence()) |value| {
+            if (value > seq_floor) seq_floor = value;
+        }
         // The reply merges over persisted state, so deleting means naming
         // the key without writing a value.
         try reply.stateInt("counter", 0);
@@ -833,10 +1261,34 @@ fn handleCommand(
         try reply.stateRemove("browsePage");
         try clearCommentSelection(reply);
         try reply.stateRemove("pendingWrite");
+        try reply.stateRemove("writeInFlight");
+        try reply.stateRemove("writeInFlightAt");
         try reply.stateRemove("lastWriteAt");
+        try reply.stateRemove("staleWrites");
+        round_stale = StaleWrites.empty;
         try reply.stateRemove("writesToday");
         try reply.stateRemove("writeDay");
-        try reply.say("计数清零，重新开始刷。");
+        // 上面是本次会话的选择、快照、计数与在途状态，都可以清；`writeSeq`
+        // 原则上保留：序号在正常区间内必须跨重置单调，否则重置后第一笔写入会复用重置前
+        // 在途那笔的 token，旧回执回来就能顶替新写入。它自己不可用（缺失、负数、
+        // 或已撞上 i64 上限）时从 `seq_floor` 重播种而不是从 0：下限已经涵盖了
+        // 在途与名单里的序号，这样重置永远是安全的解卡出口，不会顺手造出撞号。
+        // 可用时也不许低于 `seq_floor`（手改状态可能把两者写岔）。
+        //
+        // 撞上 i64 上限时这条看着像绕圈：下限本身就是上限，重播种后仍是上限，
+        // 下一笔照样 `sequence_exhausted`。但它不是死循环——这次 reset 同时删掉了
+        // `pendingWrite` 与 `staleWrites`，所以第二次 reset 读到的下限是 0，序号
+        // 回到可用区间。最坏情况要连按两次 reset，代价换来的是「重播种绝不去
+        // 复用一个可能还在桥接侧跑着的旧序号」。
+        const saved_seq = dfy.getInt(ctx.state, "writeSeq") orelse 0;
+        const seq_usable = saved_seq >= 0 and saved_seq < std.math.maxInt(i64);
+        const next_seq = if (seq_usable) @max(saved_seq, seq_floor) else seq_floor;
+        try reply.stateInt("writeSeq", next_seq);
+        if (had_in_flight) {
+            try reply.say("计数清零，重新开始刷；上一笔写入可能还在桥接侧处理，别马上重发。");
+        } else {
+            try reply.say("计数清零，重新开始刷。");
+        }
         reply.status("已重置刷抖音计数", null, 0);
         reply.schedule(1500);
         return true;
@@ -847,7 +1299,7 @@ fn handleCommand(
         const snapshot_len = snapshotItems(ctx.state).len;
         const line = std.fmt.bufPrint(
             &buffer,
-            "累计刷了 {d} 条，记了 {d} 个视频，快照里有 {d} 条，今天写入 {d} 次。",
+            "累计刷了 {d} 条，记了 {d} 个视频，快照里有 {d} 条，今天占用每日写入额度 {d} 次。",
             .{ counter, dfy.getList(ctx.state, "seen").len, snapshot_len, today },
         ) catch "统计好了。";
         try reply.say(line);
@@ -920,6 +1372,7 @@ fn handleCommand(
         };
         try requestWrite(
             ctx,
+            seq,
             write_kind,
             bridge,
             counter,
@@ -1044,38 +1497,69 @@ fn selectReply(ctx: *dfy.Context, index: usize, replies: []const dfy.Value) !voi
 // 事件处理
 // ---------------------------------------------------------------------------
 
-const WriteResult = struct {
-    kind: WriteKind,
-    ok: bool,
+const WriteReceipt = struct {
+    /// 从回执 token 认出的动作；`pendingWrite` 是损坏状态时才是 null。
+    kind: ?WriteKind,
+    /// 桥接没写 `ok` 时为 null：读不出成败就如实说无法确认，不替它下结论。
+    /// 这一笔照样算占用一次每日写入额度——见事件处理里那一支的注释。
+    ok: ?bool,
     reason: []const u8,
 };
 
-fn findWriteResult(results: []const dfy.Value) ?WriteResult {
+/// 只认和这次在途写入 token 全等的回执。`write:` 前缀只说明「这是一条写
+/// 回执」，不能说明是哪一笔：上一笔迟到的、同一 token 重复投递的、0.4.1 留下
+/// 的无序号回执，或者手改状态后对不上的，都可能撞上前缀，用前缀匹配会把当前
+/// 在途标记提前清掉、顺手播报别人的动作结果。
+fn findWriteReceipt(results: []const dfy.Value, expected: []const u8) ?WriteReceipt {
     for (results) |entry| {
         if (entry != .object) continue;
         const id = dfy.getStr(entry, "id") orelse continue;
-        const kind = kindFromEffectId(id) orelse continue;
+        if (!dfy.eql(id, expected)) continue;
         return .{
-            .kind = kind,
-            .ok = dfy.getBool(entry, "ok") orelse false,
+            .kind = kindFromToken(id),
+            .ok = dfy.getBool(entry, "ok"),
             .reason = dfy.getStr(entry, "error") orelse "",
         };
     }
     return null;
 }
 
+/// `emitWrite` 的结果。`failed` 与 `sequence_exhausted` 要分开报，否则序号用尽
+/// 会被说成「地址或正文太长」，用户根本无从恢复。`no_bridge` 与 `already_wrote`
+/// 同理分开：它们各有各的原因，混进 `failed` 会把「还没填地址」「本轮已经写过
+/// 一笔」都说成「太长」，指错方向。
+const EmitOutcome = enum { sent, failed, sequence_exhausted, no_bridge, already_wrote };
+
 /// Build and emit one write request. The URL is just the endpoint; the JSON
 /// body carries a validated id and - when the action needs it - the user's own
 /// text. Nothing from the feed can reach this function's `text` argument.
+/// On success it also claims the in-flight slot in `state` (sequence, pending
+/// token, start time, cooldown start), so the next write waits for this one.
+///
+/// `seq` 由调用方持有：宿主要在事件返回后才合并 state，这里读 `ctx.state` 只会
+/// 拿到旧值。当前每个事件至多写一笔（`writes_this_event`），这份本地副本只是
+/// 让自增在合并前就可见。
 fn emitWrite(
-    reply: *dfy.Reply,
+    ctx: *dfy.Context,
+    seq: *i64,
     kind: WriteKind,
     bridge: []const u8,
     target: []const u8,
     text: []const u8,
-) !bool {
+) !EmitOutcome {
+    const reply = ctx.reply;
+    // 没有桥接地址时什么都不发：拼出来会是一个相对路径 `/favorite`，宿主只能
+    // 当成无效请求。命令路径与两条自动写入路径都已经在上游拦过，这里是最后
+    // 一道防御。
+    if (bridge.len == 0) return .no_bridge;
+    // 一个事件至多一笔写入（见 `writes_this_event`）。按设计走不到这里：命令
+    // 分支按顺序短路，两条自动路径又都由 `writes_this_event` 串起来。真走到这里
+    // 说明有人加了第三条写入路径，那时该给它单独的 `EmitOutcome`，不要复用
+    // `.failed`——它的文案是「地址或正文太长」，会指错方向。这里先单独回
+    // `.already_wrote`，让宿主念出「本轮已经写过一笔」，而不是编一个太长。
+    if (writes_this_event > 0) return .already_wrote;
     var url_buffer: [1_024]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buffer, "{s}{s}", .{ bridge, kind.path() }) catch return false;
+    const url = std.fmt.bufPrint(&url_buffer, "{s}{s}", .{ bridge, kind.path() }) catch return .failed;
 
     // 200 个字符最多 800 字节；JSON 转义最坏翻倍，再留一点结构开销。
     var body_buffer: [Guard.max_user_text * 8 + 128]u8 = undefined;
@@ -1084,20 +1568,62 @@ fn emitWrite(
         &body_buffer,
         "{{\"{s}\":\"",
         .{kind.targetKey()},
-    ) catch return false;
+    ) catch return .failed;
     at = head.len;
-    if (!appendJsonString(&body_buffer, &at, target)) return false;
+    if (!appendJsonString(&body_buffer, &at, target)) return .failed;
     if (kind.needsText()) {
-        const middle = std.fmt.bufPrint(body_buffer[at..], "\",\"text\":\"", .{}) catch return false;
+        const middle = std.fmt.bufPrint(body_buffer[at..], "\",\"text\":\"", .{}) catch return .failed;
         at += middle.len;
-        if (!appendJsonString(&body_buffer, &at, text)) return false;
+        if (!appendJsonString(&body_buffer, &at, text)) return .failed;
     }
-    const tail = std.fmt.bufPrint(body_buffer[at..], "\"}}", .{}) catch return false;
+    const tail = std.fmt.bufPrint(body_buffer[at..], "\"}}", .{}) catch return .failed;
     at += tail.len;
 
-    try reply.httpRequest(kind.effectId(), "POST", url, body_buffer[0..at]);
-    try reply.stateStr("pendingWrite", kind.effectId());
-    return true;
+    // 每一笔写入带一个自己的序号，回执只认全等——同一端点连写两笔时，
+    // 上一笔的迟到回执不会被当成这一笔的。
+    var token_buffer: [64]u8 = undefined;
+    if (seq.* >= std.math.maxInt(i64)) return .sequence_exhausted;
+    seq.* += 1;
+    const token = std.fmt.bufPrint(&token_buffer, "write:{s}:{d}", .{ kind.actionName(), seq.* }) catch return .failed;
+
+    // 先把序号和在途槽落进 state，再发请求。这里不用为「写了一半失败」回滚：
+    // 宿主拿到的是一个完整回包，`dfy_invoke` 在任何一步失败时都改发
+    // `{"state":{},"effects":[],"pet":[]}`（见 `sdk/dfy.zig` 的 `FALLBACK`），
+    // 所以状态与请求要么一起生效、要么一起不生效，不会留下没人认领的在途槽。
+    //
+    // 上一笔还没结算就被这一笔顶替（典型：120 秒超时后重试，或 0.4.1 留下的
+    // 旧 pending），说明它可能已经在桥接侧成功、只是回执慢。这里先把它计入
+    // 每日写入额度，宁可高估也不让反复超时绕开封顶；token 只留作迟到回执的
+    // 事后确认。
+    const previous = dfy.getStr(ctx.state, "pendingWrite") orelse "";
+    var replaced_a_write = false;
+    // 「旧账先计一笔」与「旧 token 进名单」是两条独立规则：名单只收写回执形状
+    // 的 token，但读不出序号的坏 token（手改、跨版本残留）同样可能代表桥接侧
+    // 一笔真实请求，入不了名单也要计数，否则「宁可高估」在这里破功。已经在
+    // 名单上的旧 token 当初顶替时计过一次，这里不重复计。
+    if (previous.len > 0 and !dfy.eql(previous, token) and !round_stale.contains(previous)) {
+        replaced_a_write = true;
+        // 坏 token 加不进名单：没东西可存，但上面的计数已经生效。
+        if (round_stale.append(previous)) try round_stale.save(reply);
+    }
+    try reply.stateInt("writeSeq", seq.*);
+    try reply.stateStr("pendingWrite", token);
+    try reply.stateInt("writeInFlight", 1);
+    try reply.stateInt("writeInFlightAt", ctx.now);
+    // 冷却从「发出」起算，而不是等回执：收不到回执的那一笔同样占用冷却，
+    // 重试绕不开冷却；被顶替的写入已经按「可能成功」先计入每日写入额度，
+    // 迟到回执只用于播报确认结果。
+    if (replaced_a_write) {
+        // 饱和到上限：读到的值已经钳在 [0, daily_max]，再 +1 只会让落盘值
+        // 越过上限一位，下一轮还得靠读取端再钳回来。
+        const today = @min(writesToday(ctx.state, ctx.now) + 1, Guard.daily_max);
+        try reply.stateInt("writeDay", dayOf(ctx.now));
+        try reply.stateInt("writesToday", today);
+    }
+    try reply.stateInt("lastWriteAt", ctx.now);
+    try reply.httpRequest(token, "POST", url, body_buffer[0..at]);
+    writes_this_event += 1;
+    return .sent;
 }
 
 /// The write path shared by commands and auto-favourite: validate the target
@@ -1142,6 +1668,7 @@ fn targetIsSuspect(state: dfy.Value, kind: WriteKind) bool {
 
 fn requestWrite(
     ctx: *dfy.Context,
+    seq: *i64,
     kind: WriteKind,
     bridge: []const u8,
     counter: i64,
@@ -1168,11 +1695,13 @@ fn requestWrite(
         .target_len = target.len,
         .needs_text = kind.needsText(),
         .text_len = text.len,
+        .in_flight = isWriteInFlight(ctx.state, ctx.now),
         .cooldown_ms = cooldown_ms,
         .daily_limit = daily_limit,
         .now = ctx.now,
         .last_write_at = dfy.getInt(ctx.state, "lastWriteAt") orelse 0,
         .writes_today = writesToday(ctx.state, ctx.now),
+        .replaces_in_flight = replacesExpiredWrite(ctx.state, ctx.now),
     });
 
     var line_buffer: [240]u8 = undefined;
@@ -1185,10 +1714,37 @@ fn requestWrite(
         return;
     }
 
-    if (!try emitWrite(reply, kind, bridge, target, text)) {
-        try reply.say("桥接地址太长或文本编码失败，这次没发出去。");
-        reply.status("写入中止", null, counter);
-        return;
+    switch (try emitWrite(ctx, seq, kind, bridge, target, text)) {
+        .sent => {},
+        .sequence_exhausted => {
+            // 序号是 i64 上限，正常一辈子撞不到；真撞上只能靠 reset 重播种，
+            // 说成「地址太长」会让用户永远修不好。
+            try reply.say("写入序号已经用尽，先执行 reset 重置写入序号再试。");
+            reply.status("写入序号用尽", null, counter);
+            return;
+        },
+        .no_bridge => {
+            // 上游已经拦过空地址，走到这里说明配置被清掉的那一刻正好赶上，
+            // 照实说「还没填地址」，不要说成「太长」。
+            try reply.say("还没填桥接地址，先在面板里填上再试。");
+            reply.status("缺桥接地址", null, counter);
+            return;
+        },
+        .already_wrote => {
+            // 每个事件至多一笔：命令分支与两条自动路径都已经串起来。真走到这里
+            // 说明有人加了新的写入路径却没同步 `writes_this_event`，如实报「本轮
+            // 已经写过」而不是「太长」。
+            try reply.say("这一轮已经发过一笔写入了，下次再试。");
+            reply.status("本轮已写入", null, counter);
+            return;
+        },
+        .failed => {
+            // 空地址、本事件已写过一笔都已在上游拦掉；这里主要兜住「地址或
+            // 正文超出缓冲」，说清楚免得用户以为请求已经发出去了。
+            try reply.say("桥接地址或正文太长，这次没发出去。");
+            reply.status("写入中止", null, counter);
+            return;
+        },
     }
 
     const pending = std.fmt.bufPrint(&line_buffer, "正在{s}…", .{kind.doneLabel()}) catch "正在写入…";
@@ -1198,6 +1754,16 @@ fn requestWrite(
 fn onEvent(ctx: *dfy.Context) anyerror!void {
     const reply = ctx.reply;
     const kind = dfy.getStr(ctx.event, "type") orelse "tick";
+    // 回执结算和超时重试可能落在同一轮；此时不能回头读还没被宿主合并的
+    // `ctx.state`，否则刚删掉的旧 token 会被旧值复活。事件开始时只解析一次，
+    // 之后结算与顶替都改这份共享名单，最后统一落回 reply。
+    round_stale = StaleWrites.parse(dfy.getStr(ctx.state, "staleWrites") orelse "");
+    writes_this_event = 0;
+    // 时钟回拨的修正放在所有分支之前，但它改的是 `reply`，要等宿主合并 state
+    // 之后才生效。本事件里的在途 / 冷却 / 自动写入读到的仍是 `ctx.state` 里那份
+    // 未来值，因此照旧被拦住（`writeRefusal` 里也写明了这一点）。这不是「本事件
+    // 就地修正」，而是让下一个普通事件自动恢复。
+    try settleClock(ctx);
 
     const options = dfy.get(ctx.config, "options") orelse .null;
     const bridge = dfy.getStr(options, "bridgeUrl") orelse "";
@@ -1235,6 +1801,26 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
 
     const counter = dfy.getInt(ctx.state, "counter") orelse 0;
     const seen = dfy.getList(ctx.state, "seen");
+    // 序号在本次事件内只由这一处推进：`ctx.state` 要等 reply 合并后才看得到
+    // 上一笔，同一次事件里连发两笔会读到同一个旧值、撞出一样的 token。
+    var write_seq = dfy.getInt(ctx.state, "writeSeq") orelse 0;
+    // 负数会被原样拼进 token（`write:favorite:-4`），而 `tokenSequence` 只认
+    // 纯数字，之后每一笔回执都认不出动作：不计数、也不播报结果。负数一律当
+    // 损坏状态从 0 重新起算。
+    if (write_seq < 0) write_seq = 0;
+    // `writeSeq` 被旧版本或手改写坏（缺失 / 不是整数）时 `orelse 0` 会让序号
+    // 从头再来，与仍在途的那一笔撞号，旧回执就能冒充这一笔。在途 token 里
+    // 读得出的序号是最低下限，用它兜住。
+    if (dfy.getStr(ctx.state, "pendingWrite")) |pending_token| {
+        if (tokenSequence(pending_token)) |floor| {
+            if (floor > write_seq) write_seq = floor;
+        }
+    }
+    // 超时名单同样是持久状态：序号回落时新 token 也不能复用名单上的旧序号，
+    // 否则桥接重投那条旧回执会与这一笔逐字相同，被当成这一笔的成功。
+    if (round_stale.maxSequence()) |floor| {
+        if (floor > write_seq) write_seq = floor;
+    }
 
     if (dfy.eql(kind, "install")) {
         reply.status("刷抖音插件已就绪", null, counter);
@@ -1269,47 +1855,121 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
             cooldown_ms,
             user_comment,
             user_reply,
+            &write_seq,
         )) {
             return;
         }
         // "next" falls through and behaves like a tick.
     }
 
-    if (bridge.len == 0) {
-        reply.status("等待配置桥接地址", null, counter);
-        reply.schedule(60_000);
-        return;
-    }
-
     if (dfy.eql(kind, "effect-result")) {
         const results = dfy.getList(ctx.event, "effects");
+        const pending = dfy.getStr(ctx.state, "pendingWrite") orelse "";
 
         // A write came back: record it, then keep the usual rhythm going.
-        if (findWriteResult(results)) |written| {
-            var line_buffer: [240]u8 = undefined;
-            if (written.ok) {
-                const today = writesToday(ctx.state, ctx.now) + 1;
-                try reply.stateInt("writeDay", dayOf(ctx.now));
-                try reply.stateInt("writesToday", today);
-                try reply.stateInt("lastWriteAt", ctx.now);
-                const line = std.fmt.bufPrint(&line_buffer, "{s}好了。", .{written.kind.doneLabel()}) catch "写好了。";
-                try reply.say(line);
-                reply.status(line, null, counter);
-            } else {
-                var reason_buffer: [Guard.max_error * 4]u8 = undefined;
-                const reason = sanitize(&reason_buffer, written.reason, Guard.max_error);
-                const shown = if (reason.len == 0) "桥接没有响应" else reason;
-                const line = std.fmt.bufPrint(
-                    &line_buffer,
-                    "{s}失败：{s}",
-                    .{ written.kind.doneLabel(), shown },
-                ) catch "写入失败。";
-                try reply.say(line);
-                reply.status(line, null, counter);
-            }
+        const receipt: ?WriteReceipt = if (pending.len > 0) findWriteReceipt(results, pending) else null;
+        if (receipt) |written| {
+            // 只有和 `pendingWrite` 全等的回执才算这一笔结束。
             try reply.stateRemove("pendingWrite");
+            try reply.stateRemove("writeInFlight");
+            try reply.stateRemove("writeInFlightAt");
+            // 同一批里也可能带回被顶替 token 的迟到回执：顺手结算名单，
+            // 免得多等一轮才知道那笔到底成没成。
+            const stale = try settleStaleWrites(reply, results);
+
+            var line_buffer: [240]u8 = undefined;
+            if (written.kind) |written_kind| {
+                if (written.ok) |ok| {
+                    if (ok) {
+                        // 被顶替的旧写入已经在顶替那一刻计过数，这里只加当前这笔。
+                        // 饱和到上限，理由同 `emitWrite` 里那一处。
+                        const today = @min(writesToday(ctx.state, ctx.now) + 1, Guard.daily_max);
+                        try reply.stateInt("writeDay", dayOf(ctx.now));
+                        try reply.stateInt("writesToday", today);
+                        const line = std.fmt.bufPrint(&line_buffer, "{s}好了。", .{written_kind.doneLabel()}) catch "写好了。";
+                        try reply.say(line);
+                        reply.status(line, null, counter);
+                    } else {
+                        var reason_buffer: [Guard.max_error * 4]u8 = undefined;
+                        const reason = sanitize(&reason_buffer, written.reason, Guard.max_error);
+                        const shown = if (reason.len == 0) "桥接没有响应" else reason;
+                        const line = std.fmt.bufPrint(
+                            &line_buffer,
+                            "{s}失败：{s}",
+                            .{ written_kind.doneLabel(), shown },
+                        ) catch "写入失败。";
+                        try reply.say(line);
+                        reply.status(line, null, counter);
+                    }
+                } else {
+                    // 回执在、但读不出成败：不冒充成功，也不冒充失败，但**必须
+                    // 占一次额度**。不占的话，一个只回 `{id}` 不回 `ok` 的畸形
+                    // 桥接可以让 `writesToday` 永远不涨，每笔都「无法确认」，
+                    // 每日写入额度就静默失效了。这里饱和地加一笔，和成功回执同一口径
+                    // （宁可高估）；与超时名单不同，那些条目在被顶替那一刻已经计过。
+                    const line = std.fmt.bufPrint(
+                        &line_buffer,
+                        "{s}回执读不出结果，无法确认成败；已按占用一次每日写入额度计。",
+                        .{written_kind.doneLabel()},
+                    ) catch "写入回执读不出结果，无法确认。";
+                    const today = @min(writesToday(ctx.state, ctx.now) + 1, Guard.daily_max);
+                    try reply.stateInt("writeDay", dayOf(ctx.now));
+                    try reply.stateInt("writesToday", today);
+                    try reply.say(line);
+                    reply.status("写入结果无法确认", null, counter);
+                }
+            } else {
+                // 正常路径不会走到这里：`pendingWrite` 只由 `emitWrite` 写入可解析
+                // 的 token。手改或跨版本留下的损坏状态走到这里时，回执已经把
+                // 在途标记清掉了——这一笔确实结束了，只是认不出是哪个动作，
+                // 所以不计数、不播报动作结果。
+                try reply.say("这条回执认不出动作，这笔写入已结束。");
+                reply.status("写入回执无法识别", null, counter);
+            }
+            if (stale.succeeded > 0 or stale.failed > 0 or stale.unconfirmed > 0) {
+                var stale_buffer: [320]u8 = undefined;
+                try reply.say(staleSettlementLine(&stale_buffer, stale));
+                // 这一轮刚结算掉在途那一笔，所以只说旧账，不补「还在等回执」。
+            }
+            // 匹配的回执到这里就结束这一轮：同批带回的 feed 不处理，留到下一次
+            // tick 再拉。否则一句话既播报写入结果、又顺手改掉快照和选择游标，
+            // 用户刚点的那条视频会被新快照顶掉。代价是这次 feed 白拉了，所以
+            // 排期照常，下一轮按 `interval` 再来一次。
             reply.schedule(clampSeconds(interval));
             return;
+        }
+        // 超时后被顶替的旧写入，回执可能迟到。被顶替时已经先计入每日写入额度，
+        // 这里只确认结果：成功不重复计，失败也不退回。
+        const stale = try settleStaleWrites(reply, results);
+        if (stale.succeeded > 0 or stale.failed > 0 or stale.unconfirmed > 0) {
+            var stale_buffer: [320]u8 = undefined;
+            const line = staleSettlementLine(&stale_buffer, stale);
+            try reply.say(line);
+            reply.status(line, null, counter);
+            // 名单上的 token 都不是在途那一笔，所以这句话只结旧账。当前这笔
+            // 可能还在等回执，补一句，免得「成功了」被听成刚发出去的那笔。
+            if (isWriteInFlight(ctx.state, ctx.now)) {
+                try reply.say("现在这笔还在等回执。");
+            }
+            // 结算了旧回执的一轮也不处理同批 feed：这一轮的状态已经被改写，
+            // 顺手换快照会顶掉用户选中的目标，和匹配回执那一轮同理。
+            reply.schedule(clampSeconds(interval));
+            return;
+        }
+        if (hasWriteReceipt(results)) {
+            // 没有匹配到在途 token 的写回执不属于当前这一笔：上一轮迟到、同一
+            // token 重复投递、0.4.1 留下的无序号回执、`reset` 之后才到的旧回执，
+            // 或者干脆没有在途写入，都会走到这里。不改在途标记与计数（超时名单
+            // 已在上面结算过），也不播报动作结果。它到底属于哪一笔，这里判断
+            // 不出来，所以只说「不是这一笔」，不断言存在在途写入。单独到达时回
+            // 一句「已忽略」；和 feed 一起回来时先照常处理推荐，免得两句话挤在
+            // 同一轮。
+            if (findEffect(results, "feed") == null) {
+                try reply.say("这条写入回执不是这一笔的，已忽略。");
+                reply.status("已忽略对不上的写入回执", null, counter);
+                reply.schedule(clampSeconds(interval));
+                return;
+            }
         }
 
         const feed = findEffect(results, "feed") orelse {
@@ -1561,9 +2221,14 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
         // 目标 id 与正文都来自本次抓取的 id 与设置；feed 文本到这里只是被引述。
         // 任何一个环节被 `looksLikeInjection` 标记，就退回下一层，退无可退就不发。
         var wrote_this_round = false;
+        // 序号用尽说明插件的账本坏了，不是「这一条不该写」，所以它必须念出来，
+        // 而且只念一次：回复分支已经说过之后，收藏分支不能再把同一句「写入序号
+        // 用尽」重复一遍——同一轮两条一模一样的提示会让人以为发了两笔。
+        var write_blocked = false;
 
         const auto_reply_wanted = auto_reply
             and allow_writes
+            and bridge.len > 0
             and user_reply.len > 0
             and best_comment != null
             and best_comment_score >= Guard.auto_interest_score
@@ -1580,24 +2245,38 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
                 .target_len = auto_reply_target.len,
                 .needs_text = true,
                 .text_len = user_reply.len,
+                .in_flight = isWriteInFlight(ctx.state, ctx.now),
                 .cooldown_ms = cooldown_ms,
                 .daily_limit = daily_limit,
                 .now = ctx.now,
                 .last_write_at = dfy.getInt(ctx.state, "lastWriteAt") orelse 0,
                 .writes_today = writesToday(ctx.state, ctx.now),
+                .replaces_in_flight = replacesExpiredWrite(ctx.state, ctx.now),
             });
             // Same guard as the commands: a refusal here is silent, because the
             // user did not press anything.
             if (refusal == null) {
-                if (try emitWrite(reply, .reply, bridge, auto_reply_target, user_reply)) {
-                    wrote_this_round = true;
-                } else {
-                    reply.status("自动回复没发出去", null, counter + 1);
+                switch (try emitWrite(ctx, &write_seq, .reply, bridge, auto_reply_target, user_reply)) {
+                    .sent => wrote_this_round = true,
+                    // 序号用尽与「请求拼不出来」是两回事：前者唯一的出口是
+                    // `reset`，静默按「没发出去」处理会让用户永远等不到恢复。
+                    .sequence_exhausted => {
+                        try reply.say("自动回复没发出去：写入序号已经用尽，先执行 reset 重置写入序号。");
+                        reply.status("写入序号用尽", null, counter + 1);
+                        write_blocked = true;
+                    },
+                    .failed, .no_bridge, .already_wrote => reply.status("自动回复没发出去", null, counter + 1),
                 }
             }
         }
 
-        if (!wrote_this_round and auto_favorite and allow_writes and best_score >= Guard.auto_interest_score and !video_suspect) {
+        if (!wrote_this_round
+            and !write_blocked
+            and auto_favorite
+            and allow_writes
+            and bridge.len > 0
+            and best_score >= Guard.auto_interest_score
+            and !video_suspect) {
             const refusal = writeRefusal(.{
                 .allow = allow_writes,
                 .target_valid = validId(item_id),
@@ -1606,21 +2285,37 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
                 .target_len = item_id.len,
                 .needs_text = false,
                 .text_len = 0,
+                .in_flight = isWriteInFlight(ctx.state, ctx.now),
                 .cooldown_ms = cooldown_ms,
                 .daily_limit = daily_limit,
                 .now = ctx.now,
                 .last_write_at = dfy.getInt(ctx.state, "lastWriteAt") orelse 0,
                 .writes_today = writesToday(ctx.state, ctx.now),
+                .replaces_in_flight = replacesExpiredWrite(ctx.state, ctx.now),
             });
             if (refusal == null) {
-                if (!try emitWrite(reply, .favorite, bridge, item_id, "")) {
-                    reply.status("自动收藏没发出去", null, counter + 1);
+                switch (try emitWrite(ctx, &write_seq, .favorite, bridge, item_id, "")) {
+                    .sent => {},
+                    .sequence_exhausted => {
+                        try reply.say("自动收藏没发出去：写入序号已经用尽，先执行 reset 重置写入序号。");
+                        reply.status("写入序号用尽", null, counter + 1);
+                    },
+                    .failed, .no_bridge, .already_wrote => reply.status("自动收藏没发出去", null, counter + 1),
                 }
             }
         }
         // The chain only continues if we ask for it: without this the plug-in
         // would stop after the very first clip.
         reply.schedule(clampSeconds(interval));
+        return;
+    }
+
+    // tick / next 要拼请求地址，到这一步才必须知道桥接在哪。上面的命令和回执
+    // 归属都不依赖它：桥接地址被清空时，回执照样能结束在途，不会把下一笔写入
+    // 卡到超时。
+    if (bridge.len == 0) {
+        reply.status("等待配置桥接地址", null, counter);
+        reply.schedule(60_000);
         return;
     }
 

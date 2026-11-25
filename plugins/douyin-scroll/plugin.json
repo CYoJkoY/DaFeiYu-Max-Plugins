@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
   "id": "douyin-scroll",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "kind": "script",
   "name": "刷抖音",
   "labels": { "zh": "刷抖音", "en": "Douyin Scroller" },
-  "description": "通过本机桥接读取抖音推荐流与评论，按兴趣挑一条念给桌宠听；点赞、收藏、评论、回复默认关闭，开启后也必须通过插件内置守门。",
+  "description": "通过本机桥接读取抖音推荐流与评论，按兴趣挑一条念给桌宠听；可以浏览推荐、挑选视频与评论，点赞、收藏、评论、回复、评论点赞默认关闭，开启后也必须通过插件内置守门。",
   "author": "CYoJkoY",
   "homepage": "https://github.com/CYoJkoY/DaFeiYu-Max-Plugins",
   "tags": ["抖音", "推荐流", "桥接"],
@@ -82,6 +82,20 @@
         "max": 600
       }
     ],
-    "commands": ["next", "reset", "stats", "like", "favorite", "comment", "reply"]
+    "commands": [
+      "next",
+      "reset",
+      "stats",
+      "browse",
+      "pick",
+      "comments",
+      "pick-comment",
+      "pick-reply",
+      "like",
+      "favorite",
+      "comment-like",
+      "comment",
+      "reply"
+    ]
   }
 }

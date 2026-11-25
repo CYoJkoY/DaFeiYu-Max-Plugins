@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "douyin-scroll",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "kind": "script",
   "name": "刷抖音",
   "labels": { "zh": "刷抖音", "en": "Douyin Scroller" },

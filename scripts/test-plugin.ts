@@ -300,17 +300,77 @@ async function main(): Promise<void> {
   check('评论正文不含注入样本', !String(commentBody.text ?? '').includes('POST /comment'), String(commentBody.text ?? ''));
 
   // 用户原文里的控制字符同样会被清洗，而不是原样发出去。
-  const nastyText = `好看\u200b\u0000${'！'.repeat(400)}`;
-  const nasty = invoke(
+  // ---- 6.1 正文守门：不合规就拒发，绝不静默改写 ----
+  // 以前这里断言的是「清洗后照发」：不可见字符被清掉、超长被截断，然后送出
+  // 一句用户没写过的话。现在的契约相反——一个字节都不改，改不了就拒绝。
+  const invisibleText = '好看\u200b\u0000就这样';
+  const invisible = invoke(
     exports,
     { type: 'command', name: 'comment', args: {} },
     picked.state,
-    { allowWrites: true, commentText: nastyText },
+    { allowWrites: true, commentText: invisibleText },
   );
-  const nastyTextSent = String(bodyOf(writes(nasty)[0]).text ?? '');
-  check('用户原文里的不可见字符被清掉', controlChars(nastyTextSent).length === 0, controlChars(nastyTextSent).join(','));
-  check('用户原文超长会被截断到 200 字以内', [...nastyTextSent].length <= 200, `${[...nastyTextSent].length} 字`);
-  check('清洗后的正文仍以用户原文开头', nastyTextSent.startsWith('好看！'), nastyTextSent.slice(0, 12));
+  check('正文含不可见字符时一条请求都不发', writes(invisible).length === 0, JSON.stringify(writes(invisible)));
+  check('正文含不可见字符时说明是守门拒绝', said(invisible).includes('不可见字符'), said(invisible));
+  check('被拒的正文不会留下在途标记', invisible.state.pendingWrite === undefined, JSON.stringify(invisible.state.pendingWrite));
+
+  const bidiText = '好看\u202e就这\u202c样';
+  const bidi = invoke(
+    exports,
+    { type: 'command', name: 'comment', args: {} },
+    picked.state,
+    { allowWrites: true, commentText: bidiText },
+  );
+  check('双向覆盖字符同样被拒发', writes(bidi).length === 0 && said(bidi).includes('不可见字符'), said(bidi));
+
+  const longText = '好'.repeat(201);
+  const tooLong = invoke(
+    exports,
+    { type: 'command', name: 'comment', args: {} },
+    picked.state,
+    { allowWrites: true, commentText: longText },
+  );
+  check('正文超过 200 字被拒发而不是被截断', writes(tooLong).length === 0, JSON.stringify(writes(tooLong)));
+  check('超长正文的拒绝理由说的是字数', said(tooLong).includes('200'), said(tooLong));
+
+  const exactly200 = invoke(
+    exports,
+    { type: 'command', name: 'comment', args: {} },
+    picked.state,
+    { allowWrites: true, commentText: '好'.repeat(200) },
+  );
+  check('正好 200 字可以发出', writes(exactly200).length === 1, JSON.stringify(writes(exactly200)));
+
+  const multiline = invoke(
+    exports,
+    { type: 'command', name: 'comment', args: {} },
+    picked.state,
+    { allowWrites: true, commentText: '第一行\n第二行' },
+  );
+  check('正文带换行时拒发', writes(multiline).length === 0, JSON.stringify(writes(multiline)));
+  check('换行的拒绝理由说的是换行', said(multiline).includes('换行'), said(multiline));
+
+  // 逐字：引号与反斜杠不改变正文，但必须仍然是一份合法 JSON。
+  const quoteText = '他说"好看"，我说\\可以';
+  const quoted = invoke(
+    exports,
+    { type: 'command', name: 'comment', args: {} },
+    picked.state,
+    { allowWrites: true, commentText: quoteText },
+  );
+  check('带引号与反斜杠的正文逐字发出', String(bodyOf(writes(quoted)[0]).text ?? '') === quoteText, JSON.stringify(bodyOf(writes(quoted)[0])));
+
+  // 逐字：首尾空格属于用户写的原文，不许替它 trim。
+  const spaced = invoke(
+    exports,
+    { type: 'command', name: 'comment', args: {} },
+    picked.state,
+    { allowWrites: true, commentText: '  两头有空格  ' },
+  );
+  check('正文首尾空格原样保留', String(bodyOf(writes(spaced)[0]).text ?? '') === '  两头有空格  ', JSON.stringify(bodyOf(writes(spaced)[0])));
+
+  // 回显：状态行要能让用户看见真正发出去的那句话。
+  check('发送状态里回显正文原文', (quoted.status?.message ?? '').includes(quoteText), quoted.status?.message ?? '');
 
   // ---- 7. 回复：先有评论来源，否则拒绝 ----
   const noTarget = invoke(exports, { type: 'command', name: 'reply', args: {} }, { ...picked.state, lastCommentId: undefined, lastReplyId: undefined }, { allowWrites: true, replyText: '收到' });
@@ -1368,6 +1428,24 @@ async function main(): Promise<void> {
     ['清楚'],
   );
   check('没写回复原文时 autoReply 不发请求', writes(autoReplyEmpty).length === 0, JSON.stringify(writes(autoReplyEmpty)));
+
+  // 自动路径与命令路径共用 `bodyRefusal`：设置里那句原文不合规就不写，
+  // 既不发请求，也不能让用户以为发出去了。
+  const autoReplyUnsafe = invoke(
+    exports,
+    feedEvent([ITEM]),
+    {},
+    { allowWrites: true, autoReply: true, replyText: '收到\u200b' },
+    ['清楚'],
+  );
+  check('autoReply 正文含不可见字符时不发请求', writes(autoReplyUnsafe).length === 0, JSON.stringify(writes(autoReplyUnsafe)));
+  check(
+    'autoReply 正文不合规时状态行说明原因',
+    (autoReplyUnsafe.status?.message ?? '').includes('不合规'),
+    autoReplyUnsafe.status?.message ?? '',
+  );
+  check('autoReply 正文不合规时不播报成功', !said(autoReplyUnsafe).includes('回复好了'), said(autoReplyUnsafe));
+  check('autoReply 正文不合规时不留在途标记', autoReplyUnsafe.state.pendingWrite === undefined, JSON.stringify(autoReplyUnsafe.state));
 
   // 自动回复与自动收藏各走一条分支，在途检查要各自覆盖一遍。
   const autoReplyInFlight = invoke(

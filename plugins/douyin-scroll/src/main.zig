@@ -15,6 +15,7 @@
 //!
 //! 守门规则见 `WriteContext`：开关、目标格式 / 来源证明 / 可疑标记、正文非空（来源
 //! 由调用点保证）、在途写入、每日写入额度（含顶替预留）、冷却。
+//! 正文这一项由 `bodyRefusal` 定：只判定能不能原样发，绝不改写一个字。
 //! 只要有一项不满足就拒绝。命令路径会把拒绝理由念给用户听——按钮是你按的，
 //! 你得知道为什么没动静；自动路径按设计静默拒绝，`tick` 抓回来的一句话不该
 //! 替你在桌面上嚷「每日写入额度用完了」。唯一的例外是「写入序号用尽」：那
@@ -32,6 +33,11 @@
 //!    字符、零宽字符、双向覆盖、Unicode 标签字符，空白压成单空格并按字符数
 //!    截断；再过 `looksLikeInjection` 打「疑似注入」标记。带标记的内容只会被
 //!    引述展示，永远不能触发自动收藏或自动回复。
+//!
+//! 3. 传出正文上：`commentText` / `replyText` 走 `bodyRefusal` —— 只判定能否
+//!    原样发送（非空、无不可见字符、不换行、不超过 200 字），不合规就拒发并
+//!    说明理由。展示通道可以剪，发送通道不能「洗」：清洗后照发等于把可疑载荷
+//!    改写成可发送的样子，发出去的也不再是用户写的那句。
 const std = @import("std");
 const dfy = @import("dfy.zig");
 
@@ -452,6 +458,30 @@ fn sanitize(dest: []u8, text: []const u8, max_chars: usize) []const u8 {
         chars += 1;
     }
     return dest[0..out];
+}
+
+/// 传出正文的硬闸门。用户手写的评论 / 回复必须**原样**发出去，所以这条通道
+/// 只判定能不能发，绝不替它改写：删掉一个零宽字符、把换行压成空格、按 200 字
+/// 截断，都会让发出去的那句话和用户以为的那句话不是同一句，用户也无从知道。
+/// 更重要的是「清洗」等于「洗白」——手改状态或同步带进来的载荷会被悄悄改成
+/// 可发送的样子再发出去，而不是被拒绝。桥接文本走 `sanitize`（展示通道），
+/// 两条通道的规则故意不同：展示可以剪，发送不行。
+///
+/// 返回 null 表示可以逐字发送，否则返回拒绝理由（命令路径念给用户听）。
+fn bodyRefusal(text: []const u8) ?[]const u8 {
+    if (text.len == 0) return "设置里还没写要发送的原文";
+    var view = std.unicode.Utf8View.init(text) catch return "正文不是有效的 UTF-8，守门已拒绝发送";
+    var it = view.iterator();
+    var chars: usize = 0;
+    while (it.nextCodepoint()) |cp| {
+        chars += 1;
+        // 换行与制表符单独说：它们在 `isInvisible` 里也算控制符，但「不能换行」
+        // 是用户能直接改的一条，说成「不可见字符」只会让人去猜。
+        if (cp == '\n' or cp == '\r' or cp == '\t') return "正文不能换行或带制表符，守门已拒绝发送";
+        if (isInvisible(cp)) return "正文里有不可见字符（控制符 / 零宽 / 双向覆盖），守门已拒绝发送";
+    }
+    if (chars > Guard.max_user_text) return "正文超过 200 字，守门已拒绝发送，先改短再试";
+    return null;
 }
 
 /// A target id is usable only if it looks like an id and nothing else: no
@@ -1704,7 +1734,10 @@ fn requestWrite(
         .replaces_in_flight = replacesExpiredWrite(ctx.state, ctx.now),
     });
 
-    var line_buffer: [240]u8 = undefined;
+    // 正文守门。空正文已经在 `writeRefusal` 里拦过，这里管的是「有正文但不能原样发」：
+    // 含不可见字符、换行或制表符，或者超过 200 字。以前这些情况会被 `sanitize`
+    // 悄悄改写后照发，发出去的那句话和用户写的那句话不是同一句。
+    var line_buffer: [Guard.max_user_text * 4 + 128]u8 = undefined;
     if (refusal) |reason| {
         // A command always answers with the reason; silence would look like a
         // broken button.
@@ -1712,6 +1745,14 @@ fn requestWrite(
         try reply.say(line);
         reply.status(line, null, counter);
         return;
+    }
+    if (kind.needsText()) {
+        if (bodyRefusal(text)) |reason| {
+            const line = std.fmt.bufPrint(&line_buffer, "{s}：{s}", .{ kind.doneLabel(), reason }) catch reason;
+            try reply.say(line);
+            reply.status(line, null, counter);
+            return;
+        }
     }
 
     switch (try emitWrite(ctx, seq, kind, bridge, target, text)) {
@@ -1747,7 +1788,12 @@ fn requestWrite(
         },
     }
 
-    const pending = std.fmt.bufPrint(&line_buffer, "正在{s}…", .{kind.doneLabel()}) catch "正在写入…";
+    // 回显真正发出去的那句话：用户按一次按钮就该看得见桥接收到的是什么字节。
+    // 没有正文的动作（点赞 / 收藏 / 评论点赞）只报动作名。
+    const pending = if (kind.needsText())
+        std.fmt.bufPrint(&line_buffer, "正在{s}：「{s}」（逐字发送）", .{ kind.doneLabel(), text }) catch "正在写入…"
+    else
+        std.fmt.bufPrint(&line_buffer, "正在{s}…", .{kind.doneLabel()}) catch "正在写入…";
     reply.status(pending, null, counter);
 }
 
@@ -1785,19 +1831,12 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
     const interests = dfy.getList(ctx.config, "interests");
 
     // The only text this plug-in may ever send: what the user typed into the
-    // settings panel. Sanitised once, reused verbatim.
-    var comment_buffer: [Guard.max_user_text * 4]u8 = undefined;
-    const user_comment = sanitize(
-        &comment_buffer,
-        dfy.getStr(options, "commentText") orelse "",
-        Guard.max_user_text,
-    );
-    var reply_buffer: [Guard.max_user_text * 4]u8 = undefined;
-    const user_reply = sanitize(
-        &reply_buffer,
-        dfy.getStr(options, "replyText") orelse "",
-        Guard.max_user_text,
-    );
+    // settings panel, taken byte for byte. It is deliberately **not** sanitised
+    // here - `sanitize` belongs to the display channel, and quietly rewriting
+    // the body would send a sentence the user never wrote. Whether the stored
+    // text may go out at all is decided by `bodyRefusal` at the write gate.
+    const user_comment = dfy.getStr(options, "commentText") orelse "";
+    const user_reply = dfy.getStr(options, "replyText") orelse "";
 
     const counter = dfy.getInt(ctx.state, "counter") orelse 0;
     const seen = dfy.getList(ctx.state, "seen");
@@ -2256,16 +2295,24 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
             // Same guard as the commands: a refusal here is silent, because the
             // user did not press anything.
             if (refusal == null) {
-                switch (try emitWrite(ctx, &write_seq, .reply, bridge, auto_reply_target, user_reply)) {
-                    .sent => wrote_this_round = true,
-                    // 序号用尽与「请求拼不出来」是两回事：前者唯一的出口是
-                    // `reset`，静默按「没发出去」处理会让用户永远等不到恢复。
-                    .sequence_exhausted => {
-                        try reply.say("自动回复没发出去：写入序号已经用尽，先执行 reset 重置写入序号。");
-                        reply.status("写入序号用尽", null, counter + 1);
-                        write_blocked = true;
-                    },
-                    .failed, .no_bridge, .already_wrote => reply.status("自动回复没发出去", null, counter + 1),
+                // 自动路径的正文同样过 `bodyRefusal`：设置里那句原文不合规就
+                // 不写，一个字也不改。静默是有代价的——用户开了自动回复却永远
+                // 等不到，会以为插件坏了——所以这里留一行状态，指明手动执行
+                // `reply` 能看到具体原因。
+                if (bodyRefusal(user_reply) == null) {
+                    switch (try emitWrite(ctx, &write_seq, .reply, bridge, auto_reply_target, user_reply)) {
+                        .sent => wrote_this_round = true,
+                        // 序号用尽与「请求拼不出来」是两回事：前者唯一的出口是
+                        // `reset`，静默按「没发出去」处理会让用户永远等不到恢复。
+                        .sequence_exhausted => {
+                            try reply.say("自动回复没发出去：写入序号已经用尽，先执行 reset 重置写入序号。");
+                            reply.status("写入序号用尽", null, counter + 1);
+                            write_blocked = true;
+                        },
+                        .failed, .no_bridge, .already_wrote => reply.status("自动回复没发出去", null, counter + 1),
+                    }
+                } else {
+                    reply.status("自动回复没发出去：设置里的回复正文不合规，手动执行一次 reply 会说明原因", null, counter + 1);
                 }
             }
         }

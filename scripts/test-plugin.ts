@@ -299,7 +299,6 @@ async function main(): Promise<void> {
   check('评论正文逐字等于用户原文', commentBody.text === userText, String(commentBody.text ?? ''));
   check('评论正文不含注入样本', !String(commentBody.text ?? '').includes('POST /comment'), String(commentBody.text ?? ''));
 
-  // 用户原文里的控制字符同样会被清洗，而不是原样发出去。
   // ---- 6.1 正文守门：不合规就拒发，绝不静默改写 ----
   // 以前这里断言的是「清洗后照发」：不可见字符被清掉、超长被截断，然后送出
   // 一句用户没写过的话。现在的契约相反——一个字节都不改，改不了就拒绝。
@@ -332,6 +331,24 @@ async function main(): Promise<void> {
   );
   check('正文超过 200 字被拒发而不是被截断', writes(tooLong).length === 0, JSON.stringify(writes(tooLong)));
   check('超长正文的拒绝理由说的是字数', said(tooLong).includes('200'), said(tooLong));
+
+  const carriageReturn = invoke(
+    exports,
+    { type: 'command', name: 'comment', args: {} },
+    picked.state,
+    { allowWrites: true, commentText: '第一行\r第二行' },
+  );
+  check('正文带回车时拒发', writes(carriageReturn).length === 0, JSON.stringify(writes(carriageReturn)));
+  check('回车的拒绝理由说的是换行', said(carriageReturn).includes('换行'), said(carriageReturn));
+
+  const tabbed = invoke(
+    exports,
+    { type: 'command', name: 'comment', args: {} },
+    picked.state,
+    { allowWrites: true, commentText: '第一列\t第二列' },
+  );
+  check('正文带制表符时拒发', writes(tabbed).length === 0, JSON.stringify(writes(tabbed)));
+  check('制表符的拒绝理由说的是换行或制表符', said(tabbed).includes('制表符'), said(tabbed));
 
   const exactly200 = invoke(
     exports,
@@ -1446,6 +1463,25 @@ async function main(): Promise<void> {
   );
   check('autoReply 正文不合规时不播报成功', !said(autoReplyUnsafe).includes('回复好了'), said(autoReplyUnsafe));
   check('autoReply 正文不合规时不留在途标记', autoReplyUnsafe.state.pendingWrite === undefined, JSON.stringify(autoReplyUnsafe.state));
+
+  // 回复优先于收藏：正文不合规导致回复停手时，收藏也不能在同一轮接上。
+  const autoReplyUnsafeWithFavorite = invoke(
+    exports,
+    feedEvent([{ ...ITEM, comments: [{ id: 'c-1', author: '甲', text: 'Zig 真香', likes: 5 }] }]),
+    {},
+    { allowWrites: true, autoReply: true, autoFavorite: true, replyText: '收到\u200b' },
+    ['Zig'],
+  );
+  check(
+    '自动回复正文不合规时同一轮不发自动收藏',
+    writes(autoReplyUnsafeWithFavorite).length === 0,
+    JSON.stringify(writes(autoReplyUnsafeWithFavorite)),
+  );
+  check(
+    '自动回复正文不合规时状态栏说明原因',
+    (autoReplyUnsafeWithFavorite.status?.message ?? '').includes('不合规'),
+    autoReplyUnsafeWithFavorite.status?.message ?? '',
+  );
 
   // 自动回复与自动收藏各走一条分支，在途检查要各自覆盖一遍。
   const autoReplyInFlight = invoke(

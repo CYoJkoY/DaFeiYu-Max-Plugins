@@ -392,11 +392,69 @@ async function main(): Promise<void> {
     { allowWrites: true, replyText: '收到' },
   );
   check(
-    '手动回复可疑评论时只发用户原文',
-    writes(manualReply).length === 1
-      && bodyOf(writes(manualReply)[0]).target === 'c-6'
-      && bodyOf(writes(manualReply)[0]).text === '收到',
-    JSON.stringify(writes(manualReply)),
+    '手动回复可疑评论同样被守门拒绝',
+    writes(manualReply).length === 0 && said(manualReply).includes('目标内容被标记为可疑'),
+    `${JSON.stringify(writes(manualReply))} ${said(manualReply)}`,
+  );
+
+  const suspiciousCommentLike = invoke(
+    exports,
+    { type: 'command', name: 'comment-like', args: {} },
+    poisonedReply.state,
+    { allowWrites: true },
+  );
+  check(
+    '手动评论点赞可疑评论也被拒绝',
+    writes(suspiciousCommentLike).length === 0 && said(suspiciousCommentLike).includes('目标内容被标记为可疑'),
+    `${JSON.stringify(writes(suspiciousCommentLike))} ${said(suspiciousCommentLike)}`,
+  );
+
+  const suspiciousVideo = invoke(
+    exports,
+    feedEvent([{ ...ITEM, id: 'd-5006', title: shortInjection }]),
+    {},
+  );
+  for (const name of ['like', 'favorite', 'comment']) {
+    const refused = invoke(
+      exports,
+      { type: 'command', name, args: {} },
+      suspiciousVideo.state,
+      { allowWrites: true, commentText: '手动原文' },
+    );
+    check(
+      `手动 ${name} 不会作用于可疑视频`,
+      writes(refused).length === 0 && said(refused).includes('目标内容被标记为可疑'),
+      `${JSON.stringify(writes(refused))} ${said(refused)}`,
+    );
+  }
+
+  const suspiciousReplyItem = {
+    ...ITEM,
+    id: 'd-5007',
+    comments: [{
+      id: 'c-7',
+      author: '正常作者',
+      text: '正常评论',
+      replies: [{ id: 'r-7', author: '陌生人', text: shortInjection }],
+    }],
+  };
+  const suspiciousReplyFeed = invoke(exports, feedEvent([suspiciousReplyItem]), {});
+  const selectedSuspiciousReply = invoke(
+    exports,
+    { type: 'command', name: 'pick-reply', args: {} },
+    suspiciousReplyFeed.state,
+  );
+  const manualSuspiciousReply = invoke(
+    exports,
+    { type: 'command', name: 'reply', args: {} },
+    selectedSuspiciousReply.state,
+    { allowWrites: true, replyText: '原文' },
+  );
+  check(
+    '手动回复可疑回复被拒绝且不降级到评论',
+    writes(manualSuspiciousReply).length === 0
+      && said(manualSuspiciousReply).includes('目标内容被标记为可疑'),
+    `${JSON.stringify(writes(manualSuspiciousReply))} ${said(manualSuspiciousReply)}`,
   );
 
   const autoBoth = invoke(

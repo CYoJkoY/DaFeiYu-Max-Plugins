@@ -378,6 +378,7 @@ const WriteContext = struct {
     target_valid: bool,
     /// 目标 id 是否在最近一次抓取的 `videoIds` / `commentIds` / `replyIds` 里。
     target_proven: bool,
+    target_suspect: bool,
     target_len: usize,
     needs_text: bool,
     text_len: usize,
@@ -395,6 +396,7 @@ fn writeRefusal(ctx: WriteContext) ?[]const u8 {
     if (ctx.target_len == 0) return "还没有选中目标，先 browse / pick 选一条视频";
     if (!ctx.target_valid) return "选中的目标格式不对，拒绝写入";
     if (!ctx.target_proven) return "选中的目标不在最近一次抓取里，重新刷一次再选";
+    if (ctx.target_suspect) return "目标内容被标记为可疑，守门已拒绝写入";
     if (ctx.needs_text and ctx.text_len == 0) return "设置里还没写要发送的原文";
     if (ctx.writes_today >= ctx.daily_limit) return "今天的写入次数用完了";
     if (ctx.last_write_at > 0 and ctx.now - ctx.last_write_at < ctx.cooldown_ms) return "写入冷却中，晚点再试";
@@ -1122,6 +1124,22 @@ fn resolveTarget(state: dfy.Value, kind: WriteKind) struct { id: []const u8, pro
     };
 }
 
+fn targetIsSuspect(state: dfy.Value, kind: WriteKind) bool {
+    const video_id = dfy.getStr(state, "lastId") orelse "";
+    const video = findById(snapshotItems(state), video_id) orelse return true;
+    if (kind != .reply and kind != .comment_like) {
+        return dfy.getBool(video, "suspect") orelse true;
+    }
+    const comment_id = dfy.getStr(state, "lastCommentId") orelse "";
+    const comment = findById(dfy.getList(video, "comments"), comment_id) orelse return true;
+    const reply_id = dfy.getStr(state, "lastReplyId") orelse "";
+    if (kind == .comment_like or reply_id.len == 0) {
+        return dfy.getBool(comment, "suspect") orelse true;
+    }
+    const selected_reply = findById(dfy.getList(comment, "replies"), reply_id) orelse return true;
+    return dfy.getBool(selected_reply, "suspect") orelse true;
+}
+
 fn requestWrite(
     ctx: *dfy.Context,
     kind: WriteKind,
@@ -1146,6 +1164,7 @@ fn requestWrite(
         .allow = allow_writes,
         .target_valid = validId(target),
         .target_proven = stateContainsId(ctx.state, resolved.provenance, target),
+        .target_suspect = targetIsSuspect(ctx.state, kind),
         .target_len = target.len,
         .needs_text = kind.needsText(),
         .text_len = text.len,
@@ -1557,6 +1576,7 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
                 // ctx.state 还没有合入本次快照，来源证明只能在这次抓取上重算。
                 .target_proven = provenReply(items, auto_reply_target)
                     or provenComment(items, auto_reply_target),
+                .target_suspect = auto_reply_suspect,
                 .target_len = auto_reply_target.len,
                 .needs_text = true,
                 .text_len = user_reply.len,
@@ -1582,6 +1602,7 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
                 .allow = allow_writes,
                 .target_valid = validId(item_id),
                 .target_proven = provenVideo(items, item_id),
+                .target_suspect = video_suspect,
                 .target_len = item_id.len,
                 .needs_text = false,
                 .text_len = 0,

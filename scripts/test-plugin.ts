@@ -312,6 +312,48 @@ async function main(): Promise<void> {
   check('正文含不可见字符时一条请求都不发', writes(invisible).length === 0, JSON.stringify(writes(invisible)));
   check('正文含不可见字符时说明是守门拒绝', said(invisible).includes('不可见字符'), said(invisible));
   check('被拒的正文不会留下在途标记', invisible.state.pendingWrite === undefined, JSON.stringify(invisible.state.pendingWrite));
+  // 基线要让冷却先过去（默认 60 秒），否则 `writeRefusal` 会先以「冷却中」返回，
+  // `bodyRefusal` 根本跑不到，下面几条断言就恒真了。
+  //
+  // 基线还得带一笔「已超时但没结算」的旧写入：`emitWrite` 只在顶替旧写入时才
+  // 让 `writesToday` +1，没有旧 `pendingWrite` 时哪怕请求真的发出去，计数也一动
+  // 不动——「不记每日额度」就成了恒真断言。130 秒前发出的那笔已越过 120 秒在途
+  // 窗口，算超时、可被顶替，所以正文守门一旦失效，下面七条断言全都会跟着变。
+  //
+  // 在途标记故意取 5 而不是 1：非零整数都算「有一笔在途」，超时判定仍由 130 秒前
+  // 的 `writeInFlightAt` 决定，这一笔照样可被顶替；而守门失效、请求真的发出去时
+  // `emitWrite` 会把它覆写成 1，基线取 1 的话两边同值，那条断言就永远通过。
+  const counted = {
+    ...picked.state,
+    lastWriteAt: NOW - 130_000,
+    writesToday: 2,
+    writeDay: Math.floor(NOW / 86_400_000),
+    writeSeq: 7,
+    pendingWrite: 'write:comment:3',
+    writeInFlight: 5,
+    writeInFlightAt: NOW - 130_000,
+  };
+  const invisibleCounted = invoke(
+    exports,
+    { type: 'command', name: 'comment', args: {} },
+    counted,
+    { allowWrites: true, commentText: invisibleText },
+  );
+  check('被拒的正文不占冷却', invisibleCounted.state.lastWriteAt === NOW - 130_000, JSON.stringify(invisibleCounted.state.lastWriteAt));
+  check('被拒的正文不记每日额度', invisibleCounted.state.writesToday === 2, JSON.stringify(invisibleCounted.state.writesToday));
+  check('被拒的正文不消耗写入序号', invisibleCounted.state.writeSeq === 7, JSON.stringify(invisibleCounted.state.writeSeq));
+  check(
+    '被拒的正文不顶替旧写入',
+    invisibleCounted.state.pendingWrite === 'write:comment:3',
+    JSON.stringify(invisibleCounted.state.pendingWrite),
+  );
+  check('被拒的正文不动在途标记', invisibleCounted.state.writeInFlight === 5, JSON.stringify(invisibleCounted.state.writeInFlight));
+  check(
+    '被拒的正文不刷新在途时间',
+    invisibleCounted.state.writeInFlightAt === NOW - 130_000,
+    JSON.stringify(invisibleCounted.state.writeInFlightAt),
+  );
+  check('冷却过期后被拒的理由仍是正文守门', said(invisibleCounted).includes('不可见字符'), said(invisibleCounted));
 
   const bidiText = '好看\u202e就这\u202c样';
   const bidi = invoke(
@@ -366,6 +408,91 @@ async function main(): Promise<void> {
   );
   check('正文带换行时拒发', writes(multiline).length === 0, JSON.stringify(writes(multiline)));
   check('换行的拒绝理由说的是换行', said(multiline).includes('换行'), said(multiline));
+
+  // 全空白正文：桥接侧会把它当成空评论退回 400，白占一次冷却；失败回执不计
+  // 每日额度（同一文件下面「失败回执不增加每日写入计数」那条钉的就是这个）。
+  for (const [label, text] of [
+    ['半角空格', '   '],
+    ['全角空格', '\u3000\u3000'],
+    ['不换行空格', '\u00a0'],
+    ['em space U+2003', '\u2003\u2003'],
+    ['hair space U+200A', '\u200a'],
+    ['欧甘文空格 U+1680', '\u1680'],
+    ['窄不换行空格 U+202F', '\u202f'],
+    ['数学空格 U+205F', '\u205f'],
+  ]) {
+    const blank = invoke(
+      exports,
+      { type: 'command', name: 'comment', args: {} },
+      picked.state,
+      { allowWrites: true, commentText: text },
+    );
+    check(`纯${label}的正文被拒发`, writes(blank).length === 0, JSON.stringify(writes(blank)));
+    check(`纯${label}的正文拒绝理由说的是空白`, said(blank).includes('空白'), said(blank));
+  }
+
+  // 软连字符、行分隔符与空白填充符：渲染出来什么都不占，却能把真正的句子藏
+  // 起来。U+061C 则属于「只过滤 U+200x 就会漏掉」的那批双向控制符。
+  for (const [label, text] of [
+    ['软连字符 U+00AD', '好看\u00ad就这样'],
+    ['阿拉伯字母标记 U+061C', '好看\u061c就这样'],
+    ['行分隔符 U+2028', '好看\u2028就这样'],
+    ['段落分隔符 U+2029', '好看\u2029就这样'],
+    ['韩文填充符 U+115F', '好看\u115f就这样'],
+    ['蒙古文元音分隔符 U+180E', '好看\u180e就这样'],
+    ['盲文空白 U+2800', '好看\u2800就这样'],
+    ['韩文填充符 U+3164', '好看\u3164就这样'],
+    ['半角韩文填充符 U+FFA0', '好看\uffa0就这样'],
+  ]) {
+    const hidden = invoke(
+      exports,
+      { type: 'command', name: 'comment', args: {} },
+      picked.state,
+      { allowWrites: true, commentText: text },
+    );
+    check(`正文含${label}时拒发`, writes(hidden).length === 0, JSON.stringify(writes(hidden)));
+    check(`${label} 的拒绝理由说的是不可见字符`, said(hidden).includes('不可见字符'), said(hidden));
+  }
+
+  // emoji 组合符不是「藏起来的载荷」：红心是 U+2764 U+FE0F，一家人是 ZWJ 串起来
+  // 的。它们只决定字形怎么拼，拒发等于把最常见的一句手写回复挡在门外。
+  const emojiText = '好看\u2764\ufe0f就这样';
+  const emojiWrite = invoke(
+    exports,
+    { type: 'command', name: 'comment', args: {} },
+    { ...counted },
+    { allowWrites: true, commentText: emojiText },
+  );
+  check('正文里的 emoji 组合符原样发出', writes(emojiWrite).length === 1, JSON.stringify(writes(emojiWrite)));
+  check(
+    'emoji 正文逐字等于用户原文',
+    bodyOf(writes(emojiWrite)[0]).text === emojiText,
+    String(bodyOf(writes(emojiWrite)[0]).text ?? ''),
+  );
+
+  // ZWJ 管的是「几个字形拼成一个」，同样带不了载荷：一家人、职业 emoji 都靠它。
+  const zwjText = '好看\u200d就这样';
+  const zwjWrite = invoke(
+    exports,
+    { type: 'command', name: 'comment', args: {} },
+    { ...counted },
+    { allowWrites: true, commentText: zwjText },
+  );
+  check(
+    '正文里的 ZWJ 原样发出',
+    writes(zwjWrite).length === 1 && bodyOf(writes(zwjWrite)[0]).text === zwjText,
+    JSON.stringify(writes(zwjWrite)),
+  );
+
+  // 但一条只有组合符的正文渲染出来是空的：放行发送不等于承认它有内容。
+  const combinerOnly = invoke(
+    exports,
+    { type: 'command', name: 'comment', args: {} },
+    { ...counted },
+    { allowWrites: true, commentText: '\ufe0f' },
+  );
+  check('只有组合符的正文被拒发', writes(combinerOnly).length === 0, JSON.stringify(writes(combinerOnly)));
+  check('只有组合符的正文拒绝理由说的是空白', said(combinerOnly).includes('空白'), said(combinerOnly));
 
   // 逐字：引号与反斜杠不改变正文，但必须仍然是一份合法 JSON。
   const quoteText = '他说"好看"，我说\\可以';
@@ -1400,6 +1527,46 @@ async function main(): Promise<void> {
   check('自动收藏命中兴趣时只发一条 POST /favorite', writes(autoOn).length === 1 && new URL(autoEffect?.url ?? 'http://x/').pathname === '/favorite', JSON.stringify(writes(autoOn)));
   check('自动收藏目标来自本次抓取', bodyOf(autoEffect).id === 'd-1001', JSON.stringify(bodyOf(autoEffect)));
 
+  // 「兴趣加权」只是推荐流的排序开关，不是写入许可：单条候选时关掉它照样自动
+  // 收藏，因为许可看的是被挑中那条的兴趣分。多条候选下挑谁仍按热度来，见下一条。
+  const autoNoBoost = invoke(
+    exports,
+    feedEvent([ITEM]),
+    tick.state,
+    { autoFavorite: true, allowWrites: true, interestBoost: false },
+    ['Zig'],
+  );
+  check('关掉兴趣加权后自动收藏仍只看兴趣命中', writes(autoNoBoost).length === 1, JSON.stringify(writes(autoNoBoost)));
+
+  // 挑中的那条没命中标题时，这一轮就是不写：许可没被开关关掉，只是这次没得写。
+  // 这条钉的是「许可只看被挑中那条」——闸门读兴趣分还是读挑选分，在 boost 关闭
+  // 时都会给出 0 次写入，区分不了；真正区分闸门的是上一条。
+  const noBoostHotWins = invoke(
+    exports,
+    feedEvent([{ ...ITEM, id: 'd-hotter', title: '完全无关的标题', hot: 9_000 }, { ...ITEM, hot: 1 }]),
+    tick.state,
+    { autoFavorite: true, allowWrites: true, interestBoost: false },
+    ['Zig'],
+  );
+  check('关掉加权后挑中无关视频时不自动收藏', writes(noBoostHotWins).length === 0, JSON.stringify(writes(noBoostHotWins)));
+
+  // 作者名命中封顶一次：标题里一个字都没有时，四个兴趣词一起糊在作者名上也
+  // 不能凑出标题级的分数，否则「autoFavorite 要标题里有关键词」就是空话。
+  const authorPile = invoke(
+    exports,
+    feedEvent([{
+      ...ITEM,
+      id: 'd-author-pile',
+      title: '完全无关的标题',
+      author: 'Zig 插件 抖音 视频 作者',
+      hot: 999,
+    }]),
+    tick.state,
+    { autoFavorite: true, allowWrites: true },
+    ['Zig', '插件', '抖音', '视频'],
+  );
+  check('作者名命中多个兴趣词也不自动收藏', writes(authorPile).length === 0, JSON.stringify(writes(authorPile)));
+
   // 自动路径同样受在途约束：上一笔还没回执时不能悄悄再发一笔。
   const autoInFlight = invoke(
     exports,
@@ -1437,6 +1604,69 @@ async function main(): Promise<void> {
   check('autoReply 目标是本次念出来的那条评论', bodyOf(autoReplyEffect).target === 'c-1', JSON.stringify(bodyOf(autoReplyEffect)));
   check('autoReply 正文逐字等于用户原文', bodyOf(autoReplyEffect).text === '收到', JSON.stringify(bodyOf(autoReplyEffect)));
 
+  // 点赞同理：高赞只让这条评论更容易被念出来，换不来一次自动回复。
+  const likedNoInterest = invoke(
+    exports,
+    feedEvent([{
+      ...ITEM,
+      id: 'd-liked',
+      title: '完全无关的标题',
+      comments: [{ id: 'c-liked', author: '路人丙', text: '一万赞的评论', likes: 20_000 }],
+    }]),
+    tick.state,
+    { allowWrites: true, autoReply: true, replyText: '收到' },
+    ['Zig'],
+  );
+  check('点赞很高但没命中兴趣时不自动回复', writes(likedNoInterest).length === 0, JSON.stringify(writes(likedNoInterest)));
+
+  // 反过来也得成立：命中兴趣的那条评论不能被高赞闲话挤下去。点赞折叠到
+  // 1_000 以内就是为这件事——否则闸门永远落在高赞那条上，「被念出来的评论
+  // 命中兴趣」永远不成立，自动回复等于关着。
+  const interestBeatsLikes = invoke(
+    exports,
+    feedEvent([{
+      ...ITEM,
+      id: 'd-two-comments',
+      title: '完全无关的标题',
+      comments: [
+        { id: 'c-pop', author: '路人丙', text: '一万赞的闲话', likes: 10_000 },
+        { id: 'c-match', author: '路人丁', text: '这条讲得清楚', likes: 0 },
+      ],
+    }]),
+    tick.state,
+    { allowWrites: true, autoReply: true, replyText: '收到' },
+    ['清楚'],
+  );
+  const interestBeatsLikesEffect = writes(interestBeatsLikes)[0];
+  check('命中兴趣的评论压过高赞闲话，成为念出来的那条', said(interestBeatsLikes).includes('这条讲得清楚'), said(interestBeatsLikes));
+  check(
+    'autoReply 的目标是这条命中兴趣的评论',
+    writes(interestBeatsLikes).length === 1 && bodyOf(interestBeatsLikesEffect).target === 'c-match',
+    JSON.stringify(writes(interestBeatsLikes)),
+  );
+
+  // 评论挑选压根不看「兴趣加权」：那个开关管推荐流排序，念哪条评论只看内容。
+  const replyNoBoost = invoke(
+    exports,
+    feedEvent([{
+      ...ITEM,
+      id: 'd-comments-noboost',
+      title: '完全无关的标题',
+      comments: [
+        { id: 'c-pop2', author: '路人丙', text: '一万赞的闲话', likes: 10_000 },
+        { id: 'c-match2', author: '路人丁', text: '这条讲得清楚', likes: 0 },
+      ],
+    }]),
+    tick.state,
+    { allowWrites: true, autoReply: true, replyText: '收到', interestBoost: false },
+    ['清楚'],
+  );
+  check(
+    '关掉加权后 autoReply 仍回复命中兴趣的评论',
+    writes(replyNoBoost).length === 1 && bodyOf(writes(replyNoBoost)[0]).target === 'c-match2',
+    JSON.stringify(writes(replyNoBoost)),
+  );
+
   const autoReplyEmpty = invoke(
     exports,
     feedEvent([ITEM]),
@@ -1463,6 +1693,90 @@ async function main(): Promise<void> {
   );
   check('autoReply 正文不合规时不播报成功', !said(autoReplyUnsafe).includes('回复好了'), said(autoReplyUnsafe));
   check('autoReply 正文不合规时不留在途标记', autoReplyUnsafe.state.pendingWrite === undefined, JSON.stringify(autoReplyUnsafe.state));
+  // 自动路径与命令路径共用同一套拒绝理由，但念不念是两回事：用户没按按钮，
+  // 抓回来的这一轮不该在桌面上嚷「不可见字符」。状态行只留一句「不合规」。
+  check('autoReply 被拒时不念具体理由', !said(autoReplyUnsafe).includes('不可见字符'), said(autoReplyUnsafe));
+  check('autoReply 被拒时不念守门文案', !said(autoReplyUnsafe).includes('守门'), said(autoReplyUnsafe));
+  check(
+    'autoReply 被拒时状态行指向手动 reply',
+    (autoReplyUnsafe.status?.message ?? '').includes('自动回复没发出去：设置里的回复正文不合规') &&
+      (autoReplyUnsafe.status?.message ?? '').includes('手动执行一次 reply 会说明原因'),
+    autoReplyUnsafe.status?.message ?? '',
+  );
+
+  // 被拒的自动回复同样不占冷却、不记额度、不吃序号：基线要让冷却先过期，
+  // 否则 `writeRefusal` 会先以「冷却中」返回，下面几条断言就恒真了。
+  //
+  // 基线形状与上一节「正文守门」完全一样（130 秒前的旧写入 + `writeInFlight: 5`），
+  // 理由见那一段：冷却要先过期，旧写入要能被顶替，在途标记不能取 1。
+  const autoCounted = {
+    lastWriteAt: NOW - 130_000,
+    writesToday: 2,
+    writeDay: Math.floor(NOW / DAY),
+    writeSeq: 7,
+    pendingWrite: 'write:reply:3',
+    writeInFlight: 5,
+    writeInFlightAt: NOW - 130_000,
+  };
+  const autoReplyUnsafeCounted = invoke(
+    exports,
+    feedEvent([ITEM]),
+    autoCounted,
+    { allowWrites: true, autoReply: true, replyText: '收到\u200b' },
+    ['清楚'],
+  );
+  check(
+    'autoReply 被拒时不占冷却',
+    autoReplyUnsafeCounted.state.lastWriteAt === NOW - 130_000,
+    JSON.stringify(autoReplyUnsafeCounted.state.lastWriteAt),
+  );
+  check(
+    'autoReply 被拒时不记每日额度',
+    autoReplyUnsafeCounted.state.writesToday === 2,
+    JSON.stringify(autoReplyUnsafeCounted.state.writesToday),
+  );
+  check(
+    'autoReply 被拒时不消耗写入序号',
+    autoReplyUnsafeCounted.state.writeSeq === 7,
+    JSON.stringify(autoReplyUnsafeCounted.state.writeSeq),
+  );
+  check(
+    'autoReply 被拒时不顶替旧写入',
+    autoReplyUnsafeCounted.state.pendingWrite === 'write:reply:3',
+    JSON.stringify(autoReplyUnsafeCounted.state.pendingWrite),
+  );
+  check(
+    'autoReply 被拒时不动在途标记',
+    autoReplyUnsafeCounted.state.writeInFlight === 5,
+    JSON.stringify(autoReplyUnsafeCounted.state.writeInFlight),
+  );
+  check(
+    'autoReply 被拒时不刷新在途时间',
+    autoReplyUnsafeCounted.state.writeInFlightAt === NOW - 130_000,
+    JSON.stringify(autoReplyUnsafeCounted.state.writeInFlightAt),
+  );
+
+  // 自动路径与命令路径判定的是同一套规则：换行、制表符、纯空白、超长同样拒发。
+  for (const [label, text] of [
+    ['换行', '收到\n再说'],
+    ['制表符', '收到\t再说'],
+    ['纯空白', '   '],
+    ['超过 200 字', '好'.repeat(201)],
+  ]) {
+    const autoUnsafe = invoke(
+      exports,
+      feedEvent([ITEM]),
+      {},
+      { allowWrites: true, autoReply: true, replyText: text },
+      ['清楚'],
+    );
+    check(`autoReply 正文带${label}时不发请求`, writes(autoUnsafe).length === 0, JSON.stringify(writes(autoUnsafe)));
+    check(
+      `autoReply 正文带${label}时状态行说明原因`,
+      (autoUnsafe.status?.message ?? '').includes('不合规'),
+      autoUnsafe.status?.message ?? '',
+    );
+  }
 
   // 回复优先于收藏：正文不合规导致回复停手时，收藏也不能在同一轮接上。
   const autoReplyUnsafeWithFavorite = invoke(
@@ -1478,9 +1792,19 @@ async function main(): Promise<void> {
     JSON.stringify(writes(autoReplyUnsafeWithFavorite)),
   );
   check(
-    '自动回复正文不合规时状态栏说明原因',
-    (autoReplyUnsafeWithFavorite.status?.message ?? '').includes('不合规'),
-    autoReplyUnsafeWithFavorite.status?.message ?? '',
+    '自动回复被拒时也不带任何 /favorite 效果',
+    autoReplyUnsafeWithFavorite.effects.every(effect => !(effect.url ?? '').endsWith('/favorite')),
+    JSON.stringify(autoReplyUnsafeWithFavorite.effects.map(effect => effect.url)),
+  );
+  check(
+    '自动回复被拒不留在途标记',
+    autoReplyUnsafeWithFavorite.state.pendingWrite === undefined,
+    JSON.stringify(autoReplyUnsafeWithFavorite.state.pendingWrite),
+  );
+  check(
+    '自动回复被拒不记每日写入额度',
+    autoReplyUnsafeWithFavorite.state.writesToday === undefined,
+    JSON.stringify(autoReplyUnsafeWithFavorite.state.writesToday),
   );
 
   // 自动回复与自动收藏各走一条分支，在途检查要各自覆盖一遍。

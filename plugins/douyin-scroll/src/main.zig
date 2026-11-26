@@ -10,20 +10,21 @@
 //! 推荐流、评论、回复全部是陌生人写的文本。它们可以进入桌宠嘴里，但**永远
 //! 不能变成动作**：不能决定写什么、写给谁。写请求只有一条合法路径：
 //!
-//!   `command`（或明确开启的自动收藏 / 自动回复） → `writeRefusal` 通过 → 发出请求
-//!   （正文只可能是用户手写原文；`like` / `favorite` / `comment-like` 不带正文）。
+//!   `command`（或明确开启的自动收藏 / 自动回复） → `writeRefusal` 与 `bodyRefusal`
+//!   都通过 → 发出请求（正文只可能是用户手写原文；`like` / `favorite` /
+//!   `comment-like` 不带正文）。
 //!
-//! 守门规则见 `WriteContext`：开关、目标格式 / 来源证明 / 可疑标记、正文非空（来源
-//! 由调用点保证）、在途写入、每日写入额度（含顶替预留）、冷却。
-//! 正文这一项由 `bodyRefusal` 定：只判定能不能原样发，绝不改写一个字。
-//! 只要有一项不满足就拒绝。命令路径会把拒绝理由念给用户听——按钮是你按的，
-//! 你得知道为什么没动静；自动路径对普通拒绝保持安静，`tick` 抓回来的一句话
-//! 不该替你在桌面上嚷「每日写入额度用完了」。两个例外都由调用点处理：正文
-//! 不合规只留一行状态，提示用户手动执行命令看具体原因；「写入序号用尽」才
-//! 念出来——那不是「这一条不该写」，而是插件的写入账本坏了，恢复动作必须
-//! 说出来。两条路径共用同一份守门，没有哪条能绕过去。
+//! 守门规则见 `WriteContext`：开关、目标格式 / 来源证明 / 可疑标记、在途写入、
+//! 每日写入额度（含顶替预留）、冷却；正文它只看「有没有」——空正文在这里就被
+//! 拦下，来源由调用点保证。「这句正文能不能原样发出去」是另一项，由
+//! `bodyRefusal` 判，它只看不改。只要有一项不满足就拒绝。命令路径会把拒绝理由
+//! 念给用户听——按钮是你按的，你得知道为什么没动静；自动路径对普通拒绝保持
+//! 安静，`tick` 抓回来的一句话不该替你在桌面上嚷「每日写入额度用完了」。两个
+//! 例外都由调用点处理：正文不合规只留一行状态，提示用户手动执行命令看具体
+//! 原因；「写入序号用尽」才念出来——那不是「这一条不该写」，而是插件的写入
+//! 账本坏了，恢复动作必须说出来。两条路径共用同一份守门，没有哪条能绕过去。
 //!
-//! ## 提示词注入的两道防线
+//! ## 提示词注入的防线与正文通道
 //!
 //! 1. 结构上：写请求的目标 id 必须同时「格式合法」且「在最近一次抓取的快照里」
 //!    出现过——`videoIds` / `commentIds` / `replyIds` 就是来源证明，桥接文本
@@ -31,14 +32,15 @@
 //!    绝不拼接 feed 内容。`browse` / `pick` / `comments` 这些选择命令只认编号，
 //!    不认内容。
 //! 2. 文本上：所有来自桥接的文本在交给桌宠之前都过 `sanitize` —— 去掉控制
-//!    字符、零宽字符、双向覆盖、Unicode 标签字符，空白压成单空格并按字符数
-//!    截断；再过 `looksLikeInjection` 打「疑似注入」标记。带标记的内容只会被
-//!    引述展示，永远不能触发自动收藏或自动回复。
-//!
+//!    符、零宽字符（emoji 组合符除外）、软连字符、双向控制符、行分隔符、空白
+//!    填充符与 Unicode 标签字符，空白压成单空格并按字符数截断；再过
+//!    `looksLikeInjection` 打「疑似注入」标记。带标记的内容只会被引述展示，
+//!    永远不能触发自动收藏或自动回复。
 //! 3. 传出正文上：`commentText` / `replyText` 走 `bodyRefusal` —— 只判定能否
-//!    原样发送（无不可见字符、不换行或制表符、不超过 200 字），不合规就拒发
-//!    并说明理由。展示通道可以剪，发送通道不能「洗」：清洗后照发会让发出去
-//!    的那句变成用户没写过的话。
+//!    原样发送（不含控制符、零宽字符、软连字符、双向控制符、行分隔符、空白
+//!    填充符或 Unicode 标签字符，不换行 / 回车 / 制表符，至少有一个可见字符，
+//!    不超过 200 字），不合规就拒发并说明理由；两条通道的规则为什么故意不同，
+//!    理由只写在 `bodyRefusal` 那一段。
 const std = @import("std");
 const dfy = @import("dfy.zig");
 
@@ -105,11 +107,16 @@ const Guard = struct {
     /// `cooldown_ms` 独立计算（配到 600 秒时比这个窗口长），所以前跳 130 秒、
     /// 冷却 600 秒时在途已过期、冷却仍然拦得住。
     const in_flight_timeout_ms: i64 = 120_000;
-    /// 自动收藏只认「命中兴趣」的视频，热度高不算。
+    /// 自动写入的许可只看**兴趣命中**，热度与点赞只用来挑选、排序，换不来一次
+    /// 写入。阈值取标题命中一个兴趣词的得分：作者名命中只有 600，够不到这条线，
+    /// 所以「作者名里恰好带个词」不会替你写。
     const auto_interest_score: f64 = 2_000;
     /// 超时重试时被顶替的旧 token 名单上限。名单只用于事后识别回执并播报
     /// 结果；每日写入额度在被顶替那一刻就计数，所以名单再丢也不会放宽封顶。
     const stale_write_max: usize = 3;
+    /// 拒绝理由的缓冲：最长一条是「正文超过 200 字，守门已拒绝写入，先改短再
+    /// 试」，按 UTF-8 计约 62 字节；留到 96 是给字数上限改成四位数时也不至于溢出。
+    const refusal_reason_capacity: usize = 96;
 };
 
 /// 被后续写入顶替的旧 token 名单：有界，最旧的先丢。每日写入额度在被顶替时
@@ -362,14 +369,21 @@ fn snapshotItems(state: dfy.Value) []const dfy.Value {
 
 /// Interests are plain substrings; a match in the title counts more than one in
 /// the author name, so "编程" beats a creator whose handle merely contains it.
+/// The author side is capped at one hit: several interests matching the handle
+/// must not add up into a title-sized score, or a creator with a lucky name
+/// would be auto-favorited with no keyword in the title at all.
 fn interestScore(interests: []const dfy.Value, title: []const u8, author: []const u8) f64 {
     var score: f64 = 0;
+    var author_counted = false;
     for (interests) |interest| {
         if (!isString(interest)) continue;
         const word = interest.string;
         if (word.len == 0) continue;
         if (std.mem.indexOf(u8, title, word) != null) score += 2_000;
-        if (std.mem.indexOf(u8, author, word) != null) score += 600;
+        if (!author_counted and std.mem.indexOf(u8, author, word) != null) {
+            author_counted = true;
+            score += 600;
+        }
     }
     return score;
 }
@@ -398,28 +412,61 @@ fn hotScore(item: dfy.Value) f64 {
 }
 
 // ---------------------------------------------------------------------------
-// 文本清洗：桥接内容进入桌宠嘴里的唯一通道
+// 文本通道：展示清洗与发送守门
 // ---------------------------------------------------------------------------
 
 /// Characters that carry no visible glyph but can carry meaning: C0/C1
-/// controls, zero-width joiners, bidi overrides (the classic "hide the real
-/// sentence" trick) and Unicode tag characters (a whole ASCII payload can ride
-/// in them invisibly).
+/// controls, zero-width spaces and joiners, bidi overrides (the classic "hide
+/// the real sentence" trick), Unicode tag characters (a whole ASCII payload can
+/// ride in them invisibly), line and paragraph separators, the Mongolian vowel
+/// separator, the blank-rendering fillers that make text look empty while it is
+/// not, the soft hyphen, and the Arabic letter mark (the bidi control that is
+/// easy to miss when only the U+200x range is filtered).
+///
+/// Emoji combiners are deliberately absent: U+200D joins a family emoji and
+/// U+FE00..U+FE0F picks how a glyph is drawn, neither carries a payload, and
+/// rejecting them would refuse the most ordinary hand-written reply (a red
+/// heart is U+2764 U+FE0F). They still do not count as visible content - see
+/// `isCombiner`.
 fn isInvisible(cp: u21) bool {
     return switch (cp) {
         0x00...0x1F, 0x7F...0x9F => true,
-        0x200B...0x200F => true,
+        0x00AD => true,
+        0x061C => true,
+        0x115F...0x1160 => true,
+        0x180E => true,
+        0x200B...0x200C, 0x200E...0x200F => true,
+        0x2028...0x2029 => true,
         0x202A...0x202E => true,
         0x2060...0x206F => true,
+        0x2800 => true,
+        0x3164 => true,
         0xFEFF => true,
+        0xFFA0 => true,
         0xFFF9...0xFFFB => true,
         0xE0000...0xE007F => true,
         else => false,
     };
 }
 
+/// Emoji combiners: they shape the character before them instead of adding
+/// text of their own. Safe to send verbatim (the user typed them), but they are
+/// not content either - a body made only of these would render as nothing.
+fn isCombiner(cp: u21) bool {
+    return cp == 0x200D or (cp >= 0xFE00 and cp <= 0xFE0F);
+}
+
+/// Whitespace, including the Unicode space separators. `bodyRefusal` uses it to
+/// answer "is there at least one visible character at all"; `sanitize` uses it
+/// to fold runs of whitespace into one space. Leaving the separator block out
+/// would let a body made only of U+2003 (em space) pass as "visible" and be
+/// posted verbatim - the bridge would reject it as empty after the write had
+/// already taken the cooldown.
 fn isBlank(cp: u21) bool {
-    return cp == ' ' or cp == '\t' or cp == '\n' or cp == '\r' or cp == 0x3000 or cp == 0x00A0;
+    return cp == ' ' or cp == '\t' or cp == '\n' or cp == '\r'
+        or cp == 0x00A0 or cp == 0x1680
+        or (cp >= 0x2000 and cp <= 0x200A)
+        or cp == 0x202F or cp == 0x205F or cp == 0x3000;
 }
 
 /// Normalise one piece of bridge text: drop invisible characters, fold any run
@@ -465,19 +512,33 @@ fn sanitize(dest: []u8, text: []const u8, max_chars: usize) []const u8 {
 /// 桥接文本走 `sanitize`（展示通道），两条通道的规则故意不同：展示可以剪，
 /// 发送不行——清洗后照发会让发出去的那句变成用户没写过的话。
 ///
+/// `scratch` 只用来拼「超过多少字」那一条，调用点给一块几十字节的栈缓冲就够。
 /// 返回 null 表示可以逐字发送，否则返回拒绝理由（命令路径念给用户听）。
-fn bodyRefusal(text: []const u8) ?[]const u8 {
-    var view = std.unicode.Utf8View.init(text) catch return "正文不是有效的 UTF-8，守门已拒绝发送";
+fn bodyRefusal(text: []const u8, scratch: []u8) ?[]const u8 {
+    var view = std.unicode.Utf8View.init(text) catch return "正文不是有效的 UTF-8，守门已拒绝写入";
     var it = view.iterator();
     var chars: usize = 0;
+    var saw_visible = false;
     while (it.nextCodepoint()) |cp| {
         chars += 1;
         // 换行与制表符单独说：它们在 `isInvisible` 里也算控制符，但「不能换行」
         // 是用户能直接改的一条，说成「不可见字符」只会让人去猜。
-        if (cp == '\n' or cp == '\r' or cp == '\t') return "正文不能换行或带制表符，守门已拒绝发送";
-        if (isInvisible(cp)) return "正文里有不可见字符（控制符 / 零宽 / 双向覆盖），守门已拒绝发送";
+        if (cp == '\n' or cp == '\r' or cp == '\t') return "正文不能换行或带制表符，守门已拒绝写入";
+        if (isInvisible(cp)) return "正文里有不可见字符，守门已拒绝写入";
+        // 组合符（ZWJ、变体选择符）放行但不算内容：只有它们时照样是「没有
+        // 可见字符」，不能靠它们凑出一句空正文发出去。
+        if (!isBlank(cp) and !isCombiner(cp)) saw_visible = true;
     }
-    if (chars > Guard.max_user_text) return "正文超过 200 字，守门已拒绝发送，先改短再试";
+    // 全空白正文在桥接侧会被当成空评论退回来（400），冷却照占、额度不占，
+    // 理由见 `isBlank`；首尾空格是用户写的原文，所以只拦「一个可见字符都没有」。
+    if (!saw_visible) return "正文只有空白，守门已拒绝写入";
+    if (chars > Guard.max_user_text) {
+        return std.fmt.bufPrint(
+            scratch,
+            "正文超过 {d} 字，守门已拒绝写入，先改短再试",
+            .{Guard.max_user_text},
+        ) catch "正文超过上限，守门已拒绝写入，先改短再试";
+    }
     return null;
 }
 
@@ -493,10 +554,12 @@ fn validId(id: []const u8) bool {
     return true;
 }
 
-/// Escape one already-sanitised string into a JSON string body. Sanitising
-/// first means there are no control characters left to escape, so only the two
-/// structural characters need work - and a quote in the user's own text can
-/// never break out of the JSON document.
+/// Escape one string into a JSON string body. Callers hand in either a target
+/// id that already passed `validId` (ASCII alphanumerics, `_` and `-` only) or
+/// the body that already passed `bodyRefusal` (valid UTF-8, no control
+/// characters); either gate leaves only the two structural characters to
+/// escape, so a quote in the user's own text can never break out of the JSON
+/// document.
 fn appendJsonString(dest: []u8, at: *usize, text: []const u8) bool {
     for (text) |c| {
         const needed: usize = if (c == '"' or c == '\\') 2 else 1;
@@ -643,7 +706,9 @@ const WriteContext = struct {
 
 /// The guard. Returns null when the write may go out, otherwise the reason it
 /// must not. The command path shows that reason to the user; the automatic path
-/// stays silent by design, except for the sequence-exhausted case.
+/// does not speak it (sequence exhaustion excepted). A refused body is not this
+/// function's business: `bodyRefusal` handles it — the command path speaks that
+/// reason, the automatic path leaves a status line.
 fn writeRefusal(ctx: WriteContext) ?[]const u8 {
     if (!ctx.allow) return "写操作总开关是关的，先设置里勾「允许写入」";
     if (ctx.target_len == 0) return "还没有选中目标，先 browse / pick 选一条视频";
@@ -1552,7 +1617,7 @@ fn findWriteReceipt(results: []const dfy.Value, expected: []const u8) ?WriteRece
 }
 
 /// `emitWrite` 的结果。`failed` 与 `sequence_exhausted` 要分开报，否则序号用尽
-/// 会被说成「地址或正文太长」，用户根本无从恢复。`no_bridge` 与 `already_wrote`
+/// 会被说成「桥接地址太长」，用户根本无从恢复。`no_bridge` 与 `already_wrote`
 /// 同理分开：它们各有各的原因，混进 `failed` 会把「还没填地址」「本轮已经写过
 /// 一笔」都说成「太长」，指错方向。
 const EmitOutcome = enum { sent, failed, sequence_exhausted, no_bridge, already_wrote };
@@ -1582,7 +1647,7 @@ fn emitWrite(
     // 一个事件至多一笔写入（见 `writes_this_event`）。按设计走不到这里：命令
     // 分支按顺序短路，两条自动路径又都由 `writes_this_event` 串起来。真走到这里
     // 说明有人加了第三条写入路径，那时该给它单独的 `EmitOutcome`，不要复用
-    // `.failed`——它的文案是「地址或正文太长」，会指错方向。这里先单独回
+    // `.failed`——它的文案是「地址太长」，会指错方向。这里先单独回
     // `.already_wrote`，让宿主念出「本轮已经写过一笔」，而不是编一个太长。
     if (writes_this_event > 0) return .already_wrote;
     var url_buffer: [1_024]u8 = undefined;
@@ -1731,25 +1796,26 @@ fn requestWrite(
         .replaces_in_flight = replacesExpiredWrite(ctx.state, ctx.now),
     });
 
-    // 正文守门。空正文已经在 `writeRefusal` 里拦过，这里管的是「有正文但不能原样发」：
-    // 含不可见字符、换行或制表符，或者超过 200 字。以前这些情况会被 `sanitize`
-    // 悄悄改写后照发，发出去的那句话和用户写的那句话不是同一句。
+    // 这一行缓冲既装拒绝行也装发送回显。拒绝行只有「动作名：理由」，理由最多
+    // 96 字节、写在 `reason_buffer` 里；真正撑尺寸的是下面的发送回显
+    // 「正在{动作}：「{正文}」（逐字发送）」，正文最多 200 字 × 4 字节。按最坏
+    // 情况开满，回显才不会被截断。
     var line_buffer: [Guard.max_user_text * 4 + 128]u8 = undefined;
-    if (refusal) |reason| {
+    var reason_buffer: [Guard.refusal_reason_capacity]u8 = undefined;
+    // 正文守门：空正文已经在 `writeRefusal` 里拦过，这里管「有正文但不能原样发」。
+    const reason: ?[]const u8 = if (refusal) |r|
+        r
+    else if (kind.needsText())
+        bodyRefusal(text, &reason_buffer)
+    else
+        null;
+    if (reason) |r| {
         // A command always answers with the reason; silence would look like a
         // broken button.
-        const line = std.fmt.bufPrint(&line_buffer, "{s}：{s}", .{ kind.doneLabel(), reason }) catch reason;
+        const line = std.fmt.bufPrint(&line_buffer, "{s}：{s}", .{ kind.doneLabel(), r }) catch r;
         try reply.say(line);
         reply.status(line, null, counter);
         return;
-    }
-    if (kind.needsText()) {
-        if (bodyRefusal(text)) |reason| {
-            const line = std.fmt.bufPrint(&line_buffer, "{s}：{s}", .{ kind.doneLabel(), reason }) catch reason;
-            try reply.say(line);
-            reply.status(line, null, counter);
-            return;
-        }
     }
 
     switch (try emitWrite(ctx, seq, kind, bridge, target, text)) {
@@ -1777,9 +1843,9 @@ fn requestWrite(
             return;
         },
         .failed => {
-            // 空地址、本事件已写过一笔都已在上游拦掉；这里主要兜住「地址或
-            // 正文超出缓冲」，说清楚免得用户以为请求已经发出去了。
-            try reply.say("桥接地址或正文太长，这次没发出去。");
+            // 空地址、本事件已写过一笔、超长正文都已在上游拦掉；拼请求时还能
+            // 撑爆缓冲的就只剩桥接地址，说清楚免得用户以为请求已经发出去了。
+            try reply.say("桥接地址太长，这次没发出去。");
             reply.status("写入中止", null, counter);
             return;
         },
@@ -1940,9 +2006,8 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
                 } else {
                     // 回执在、但读不出成败：不冒充成功，也不冒充失败，但**必须
                     // 占一次额度**。不占的话，一个只回 `{id}` 不回 `ok` 的畸形
-                    // 桥接可以让 `writesToday` 永远不涨，每笔都「无法确认」，
-                    // 每日写入额度就静默失效了。这里饱和地加一笔，和成功回执同一口径
-                    // （宁可高估）；与超时名单不同，那些条目在被顶替那一刻已经计过。
+                    // 桥接可以让 `writesToday` 永远不涨，每笔都「无法确认」，每日
+                    // 写入额度就静默失效了。饱和加一的理由同 `emitWrite` 那一处。
                     const line = std.fmt.bufPrint(
                         &line_buffer,
                         "{s}回执读不出结果，无法确认成败；已按占用一次每日写入额度计。",
@@ -2048,6 +2113,14 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
 
         var best: ?dfy.Value = null;
         var best_score: f64 = -1e18;
+        // 兴趣分单独记一份：`best_score` 只管「挑哪条给你看」，写不写由兴趣本身
+        // 决定。两者混在一起时，热度或点赞一旦越过阈值就等于自动写，违背
+        // 「只认命中兴趣」。加权开着时两种写法等价：挑选分是热度（封顶 1_000）
+        // 加兴趣分，而作者名那条最多只计一次 600，够不到 2_000，所以只有标题
+        // 命中才可能过线。加权关掉时挑选只剩热度，闸门读的仍是被挑中那条的
+        // 兴趣分，也就是只有它自己命中标题才会写。旧写法会把「排序开关」连带
+        // 变成「写入开关」，那不是这个开关该管的事。
+        var best_interest: f64 = 0;
         var scanned: usize = 0;
         for (items) |item| {
             if (scanned >= Snapshot.videos) break;
@@ -2058,10 +2131,14 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
             if (containsId(seen, id)) continue;
             const title = dfy.getStr(item, "title") orelse "";
             const author = dfy.getStr(item, "author") orelse "";
+            const interest = interestScore(interests, title, author);
+            // `interestBoost` 只是排序权重：关掉它就不再按兴趣给推荐加分，但
+            // 「这条命中兴趣」是内容本身的事实，自动写入的许可不跟着关。
             var score = hotScore(item);
-            if (boost) score += interestScore(interests, title, author);
+            if (boost) score += interest;
             if (score > best_score) {
                 best_score = score;
+                best_interest = interest;
                 best = item;
             }
         }
@@ -2088,10 +2165,11 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
         const author = if (raw_author_text.len == 0) "未知作者" else raw_author_text;
         const video_suspect = looksLikeInjection(raw_title) or looksLikeInjection(raw_author);
 
-        // 评论：按点赞 + 兴趣挑一条，念出来就是「评价」。只在快照保留的
+        // 评论：按兴趣 + 点赞挑一条，念出来就是「评价」。只在快照保留的
         // 前 `Snapshot.comments` 条里挑，保证念到的评论一定可写。
         var best_comment: ?dfy.Value = null;
         var best_comment_score: f64 = -1e18;
+        var best_comment_interest: f64 = 0;
         var scanned_comments: usize = 0;
         for (dfy.getList(picked, "comments")) |comment| {
             if (scanned_comments >= Snapshot.comments) break;
@@ -2105,10 +2183,18 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
             if (comment_text.len > Snapshot.max_comment_bytes) continue;
             scanned_comments += 1;
             const likes = dfy.getFloat(comment, "likes") orelse 0;
-            var score: f64 = if (likes < 0) 0 else if (likes > 5_000) 5_000 else likes;
-            if (boost) score += interestScore(interests, comment_text, "");
+            // 点赞同样折叠到 1_000 以内，理由和 `hotScore` 一样：排序分要能
+            // 压住点赞数的量级差异，却不能反过来盖过兴趣命中。封顶高过 2_000
+            // 时，一条一万赞的闲话会把命中兴趣的评论挤出「被念出来」的位置，
+            // 于是闸门永远落在没命中兴趣的那条上——`autoReply` 等于形同虚设。
+            var score: f64 = if (likes < 0) 0 else if (likes > 1_000) 1_000 else likes;
+            // 评论挑选不看「兴趣加权」：那个开关管的是推荐流排序，念哪条评论
+            // 只看内容本身，所以兴趣分无条件入账。
+            const interest = interestScore(interests, comment_text, "");
+            score += interest;
             if (score > best_comment_score) {
                 best_comment_score = score;
+                best_comment_interest = interest;
                 best_comment = comment;
             }
         }
@@ -2267,7 +2353,7 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
             and bridge.len > 0
             and user_reply.len > 0
             and best_comment != null
-            and best_comment_score >= Guard.auto_interest_score
+            and best_comment_interest >= Guard.auto_interest_score
             and !video_suspect
             and !auto_reply_suspect;
         if (auto_reply_wanted) {
@@ -2289,14 +2375,14 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
                 .writes_today = writesToday(ctx.state, ctx.now),
                 .replaces_in_flight = replacesExpiredWrite(ctx.state, ctx.now),
             });
-            // Same guard as the commands: a refusal here is silent, because the
-            // user did not press anything.
+            // `writeRefusal` 的拒绝在自动路径上完全安静：用户没按任何按钮，
+            // `tick` 抓回来的一句话不该替他在桌面上嚷「每日写入额度用完了」。
             if (refusal == null) {
-                // 自动路径的正文同样过 `bodyRefusal`：设置里那句原文不合规就
-                // 不写，一个字也不改。静默是有代价的——用户开了自动回复却永远
-                // 等不到，会以为插件坏了——所以这里留一行状态，指明手动执行
-                // `reply` 能看到具体原因。
-                if (bodyRefusal(user_reply) == null) {
+                // 正文不合规是另一回事：用户开了自动回复却永远等不到，会以为
+                // 插件坏了，所以这里留一行状态，指明手动执行 `reply` 能看到
+                // 具体原因。正文本身一个字也不改。
+                var reason_buffer: [Guard.refusal_reason_capacity]u8 = undefined;
+                if (bodyRefusal(user_reply, &reason_buffer) == null) {
                     switch (try emitWrite(ctx, &write_seq, .reply, bridge, auto_reply_target, user_reply)) {
                         .sent => wrote_this_round = true,
                         // 序号用尽与「请求拼不出来」是两回事：前者唯一的出口是
@@ -2310,8 +2396,10 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
                     }
                 } else {
                     reply.status("自动回复没发出去：设置里的回复正文不合规，手动执行一次 reply 会说明原因", null, counter + 1);
-                    // 正文不合规同样是「这一条不该写」：不能再让同一轮的自动
-                    // 收藏接着发，否则就违反一条视频最多一笔自动写入。
+                    // 回复优先于收藏：用户打开的是自动回复，正文不合规时不能
+                    // 悄悄降级成一次收藏。`write_blocked` 每个 tick 都会重新置上，
+                    // 所以这条视频在回复正文修好之前会一直停在「不收藏」，不是
+                    // 只停这一轮。
                     write_blocked = true;
                 }
             }
@@ -2322,7 +2410,7 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
             and auto_favorite
             and allow_writes
             and bridge.len > 0
-            and best_score >= Guard.auto_interest_score
+            and best_interest >= Guard.auto_interest_score
             and !video_suspect) {
             const refusal = writeRefusal(.{
                 .allow = allow_writes,

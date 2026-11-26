@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-11-25T22:58:22Z",
+  "generatedAt": "2026-11-26T01:13:30Z",
   "plugins": [
     {
       "id": "douyin-scroll",
@@ -19,8 +19,8 @@
         "bridge"
       ],
       "harness": "zig-wasm32-freestanding/abi1",
-      "size": 112380,
-      "sha256": "42227fab6dbbc15966250c816172b02c1f9cf1a18ae6258b67d3e7ae83d337a7",
+      "size": 113123,
+      "sha256": "291b29ceda79a9c1f7e62c2b1b29f1a795308dd224e3b8de070ebb96da8d49a8",
       "manifest": "plugins/douyin-scroll/plugin.json",
       "wasm": "plugins/douyin-scroll/plugin.wasm",
       "labels": {

@@ -34,13 +34,22 @@
 //! 2. 文本上：所有来自桥接的文本在交给桌宠之前都过 `sanitize` —— 去掉控制
 //!    符、零宽字符（emoji 组合符除外）、软连字符、双向控制符、行分隔符、空白
 //!    填充符与 Unicode 标签字符，空白压成单空格并按字符数截断；再过
-//!    `looksLikeInjection` 打「疑似注入」标记。带标记的内容只会被引述展示，
-//!    永远不能触发自动收藏或自动回复。
+//!    `looksLikeInjection` 打标记——检测前先归一化（全角折半角、常见西里尔 /
+//!    希腊同形字折拉丁、跳过组合符与组合标记、去掉空白与标点压成紧凑视图），
+//!    「忽 略 之 前」、「Ｉｇｎｏｒｅ ｐｒｅｖｉｏｕｓ」、用同形字拼的样本，
+//!    以及往词中间塞 ZWJ、变体选择符或组合标记的写法同样命中。带标记的
+//!    条目**默认不念正文**（作者名一起拦），只报「疑似注入，已拦下」；唯一的
+//!    例外是用户显式发的 `peek`，见第 4 条。被标记的条目仍然永远不能触发自动
+//!    收藏或自动回复。
 //! 3. 传出正文上：`commentText` / `replyText` 走 `bodyRefusal` —— 只判定能否
 //!    原样发送（不含控制符、零宽字符、软连字符、双向控制符、行分隔符、空白
 //!    填充符或 Unicode 标签字符，不换行 / 回车 / 制表符，至少有一个可见字符，
 //!    不超过 200 字），不合规就拒发并说明理由；两条通道的规则为什么故意不同，
 //!    理由只写在 `bodyRefusal` 那一段。
+//! 4. 出口上：被拦下的内容只有一个出口——用户显式发 `peek`。它读的是快照里
+//!    那份净化副本（最多 200 字），念之前对着**当前**快照重新核一遍标记，快照
+//!    换了一轮就不再认旧指针；念出来的句子照样只是素材，不参与任何判定，也
+//!    绝不会进入写请求。
 const std = @import("std");
 const dfy = @import("dfy.zig");
 
@@ -59,12 +68,23 @@ const Snapshot = struct {
     const page: usize = 3;
     /// 一条评论原文超过这个字节数就不进快照：念不出来，也最容易藏东西。
     const max_comment_bytes: usize = 300;
+    /// 可疑条目额外留一份更长的净化文本，专供 `peek`：播报上限只有 60 字，
+    /// 一行攻击句往往看不全。作者名同理：播报副本只有 24 字，可疑时也按这个
+    /// 上限另存一份。只有可疑条目才写这两份，快照体积不随正常 feed 增长。
+    const peek_chars: usize = 200;
+    /// 所有可疑节点的 `peekText` / `peekAuthor` 合计最多占这么多 JSON 输出。
+    /// 这个额度要给标题、作者、链接、评论、回复和来源 id 留出空间；否则
+    /// 最坏情况下基础快照本身再加副本就会推过宿主的 48KB state 上限。预算
+    /// 超出后不再追加副本；可疑标记仍在，只是 `peek` 展示不到那段原因。
+    const peek_budget_bytes: usize = 4_000;
 };
 
 const SayBuilder = struct {
     buffer: [1_600]u8 = undefined,
     used: usize = 0,
     chars: usize = 0,
+    /// 一句话的字数上限。`peek` 的预留宽度与这里的上限绑定，两者一起算。
+    const max_chars: usize = 400;
 
     fn append(self: *SayBuilder, text: []const u8) void {
         if (text.len == 0) return;
@@ -72,7 +92,7 @@ const SayBuilder = struct {
         var iterator = view.iterator();
         var count: usize = 0;
         while (iterator.nextCodepoint() != null) count += 1;
-        if (self.chars + count > 400 or self.used + text.len > self.buffer.len) return;
+        if (self.chars + count > max_chars or self.used + text.len > self.buffer.len) return;
         @memcpy(self.buffer[self.used .. self.used + text.len], text);
         self.used += text.len;
         self.chars += count;
@@ -80,6 +100,39 @@ const SayBuilder = struct {
 
     fn slice(self: *const SayBuilder) []const u8 {
         return self.buffer[0..self.used];
+    }
+
+    /// 还能再念多少字：给随后的固定字符（引号、`@` 之类）留出 `reserve`。
+    fn room(self: *const SayBuilder, reserve: usize) usize {
+        if (self.chars + reserve >= max_chars) return 0;
+        return max_chars - self.chars - reserve;
+    }
+
+    /// 念一段可能装不下的文本：超额就按字截断并补「…」，而不是让 `append`
+    /// 把整段静默丢掉——作者名被吞掉时，「可疑的是作者名」会变成一句没有
+    /// 名字的话。`reserve` 是随后还要写的固定字符数，连「…」一起预留。
+    ///
+    /// 调用方保证 `text` 是合法 UTF-8（`peekTargetOf` 已经用 `clipChars` 验过
+    /// 整段序列）；万一还是撞上坏字节，就什么都不念，绝不把非法的整段丢给
+    /// `append`——它自己会静默丢弃，结果一样，但这里写明白意图。
+    fn appendClipped(self: *SayBuilder, text: []const u8, reserve: usize) void {
+        const budget = self.room(reserve + 1);
+        if (budget == 0) return;
+        var i: usize = 0;
+        var chars: usize = 0;
+        while (i < text.len and chars < budget) {
+            const size = std.unicode.utf8ByteSequenceLength(text[i]) catch return;
+            if (i + size > text.len) return;
+            _ = std.unicode.utf8Decode(text[i .. i + size]) catch return;
+            i += size;
+            chars += 1;
+        }
+        if (i >= text.len) {
+            self.append(text);
+            return;
+        }
+        self.append(text[0..i]);
+        self.append("…");
     }
 };
 
@@ -89,7 +142,8 @@ const Guard = struct {
     const max_id: usize = 64;
     /// 用户手写的评论文本上限（字符）。
     const max_user_text: usize = 200;
-    /// 桥接文本进入桌宠嘴里之前的截断（字符）。
+    /// 桥接文本进入桌宠嘴里之前的截断（字符）。`peek` 另有一份 200 字的
+    /// 副本，见 `Snapshot.peek_chars`；这个 60 只管正常播报。
     const max_feed_text: usize = 60;
     const max_author: usize = 24;
     const max_url: usize = 300;
@@ -99,7 +153,7 @@ const Guard = struct {
     // `_s` 是设置项里的秒数上下限，`_ms` 是内部按毫秒算的时长；两者别相加。
     const cooldown_min_s: i64 = 10;
     const cooldown_max_s: i64 = 600;
-    /// 写入发出后等回执的上限；超时视为回执丢失，解除在途拦截，免得一次
+    /// 写入发出后等回执的上限；超时视为回执丢失，解除在途锁定，免得一次
     /// 丢包把写入永久锁死。冷却照常生效，所以超时后的重试仍可能被冷却拦住。
     /// 这个窗口只管在途：时钟回拨（当前时间早于发出时间）不去判过期，而是
     /// 由 `settleClock` 把时间戳重锚到当前时间，并按在途继续拦住——最多让
@@ -319,37 +373,199 @@ fn stateContainsId(state: dfy.Value, key: []const u8, id: []const u8) bool {
     return containsId(dfy.getList(state, key), id);
 }
 
-fn containsIgnoreCase(text: []const u8, needle: []const u8) bool {
-    if (needle.len == 0 or needle.len > text.len) return false;
-    var start: usize = 0;
-    while (start + needle.len <= text.len) : (start += 1) {
-        var matched = true;
-        for (needle, 0..) |expected, offset| {
-            if (std.ascii.toLower(text[start + offset]) != std.ascii.toLower(expected)) {
-                matched = false;
-                break;
-            }
-        }
-        if (matched) return true;
+/// 滚动窗口的长度：最长的一条标记是 "ignorealltheprevious"（20 字节），留到
+/// 32 连「全角折半角 + 同形字折拉丁」之后的形式也放得下。
+const marker_window: usize = 32;
+
+/// 输入超过这么多个字节就直接判可疑。展示通道最多念 60 字，`peek` 的净化副本
+/// 最多留 200 字（UTF-8 下至多 800 字节），正常内容远远到不了 8 KB。不设「扫到
+/// 第几个码点就收工」的位置额度：那种额度要么按原始码点算，凭空塞空白、组合符
+/// 就能把攻击句推出额度之外；要么按会被念出来的码点算，规则一多又会重新出现
+/// 「扫到的部分算干净、没扫到的尾巴也算干净」的缝。超出上限整条拦下，就不存在
+/// 没扫到的尾巴。
+const max_detect_bytes: usize = 8 * 1024;
+
+/// 全角 ASCII（U+FF01–U+FF5E）折成半角，全角空格折成普通空格（与 `isBlank`
+/// 的口径对齐）。折叠只作用于检测视图，绝不改写要展示、要发送的文本。
+fn foldWidth(cp: u21) u21 {
+    if (cp >= 0xFF01 and cp <= 0xFF5E) return cp - 0xFEE0;
+    if (cp == 0x3000) return ' ';
+    return cp;
+}
+
+/// 常见同形字：西里尔与希腊字母里和拉丁字母形状一致的那些。这张表覆盖不了
+/// 所有同形字（数学字母、亚美尼亚语、各种符号变体都还在），它只是把「看着
+/// 像英文的句子」也拉进比对，不承担全部保证——真正的保证是写操作的来源证明。
+fn foldHomoglyph(cp: u21) u21 {
+    return switch (cp) {
+        0x0430, 0x0410 => 'a',
+        0x0435, 0x0415 => 'e',
+        0x043E, 0x041E => 'o',
+        0x0440, 0x0420 => 'p',
+        0x0441, 0x0421 => 'c',
+        0x0445, 0x0425 => 'x',
+        0x0443 => 'y',
+        0x0456, 0x0406 => 'i',
+        0x0458 => 'j',
+        0x0455 => 's',
+        0x04CF => 'l',
+        0x03B1 => 'a',
+        0x03B5 => 'e',
+        0x03BF => 'o',
+        0x03C1 => 'p',
+        0x03C7 => 'x',
+        0x03B9 => 'i',
+        0x03BA => 'k',
+        0x03BD => 'v',
+        0x03C4 => 't',
+        0x03C5 => 'u',
+        else => cp,
+    };
+}
+
+/// 标点与符号类：紧凑视图里不要它们，「忽 略，之 前」才能压回「忽略之前」。
+/// 变体选择符（U+FE00–U+FE0F）走不到这条判断：`isProjectionSkip` 在投影前就
+/// 把它们跳过了，这里的 FE00–FE1F 区间只兜竖向排版形式（U+FE10–U+FE1F）。
+/// 全角 ASCII（U+FF01–U+FF5E）在 `foldWidth` 里已经折成半角、也走不到这条
+/// 判断，所以这里的全角区只留折不掉的半角标点（U+FF5F–U+FF65）。
+fn isSymbolOrPunct(cp: u21) bool {
+    return (cp >= 0x2000 and cp <= 0x206F)
+        or (cp >= 0x2190 and cp <= 0x2BFF)
+        or (cp >= 0x2E00 and cp <= 0x2E7F)
+        or (cp >= 0x3000 and cp <= 0x303F)
+        or (cp >= 0xFE00 and cp <= 0xFE1F)
+        or (cp >= 0xFE30 and cp <= 0xFE6F)
+        or (cp >= 0xFF5F and cp <= 0xFF65)
+        or (cp >= 0x1F000 and cp <= 0x1FAFF);
+}
+
+/// 紧凑视图的一个码点：字母与数字留下（ASCII 转小写、全角折半角、同形字折
+/// 拉丁），空白、标点、符号与 emoji 全部丢掉。`忽 略 之 前`、
+/// `Ｉｇｎｏｒｅ ｐｒｅｖｉｏｕｓ`、`ignоre.previous` 在这张视图上是同一句话。
+fn compactCodepoint(cp: u21) ?u21 {
+    const folded = foldHomoglyph(foldWidth(cp));
+    // 空白必须先挡掉：U+00A0 / U+1680 / U+202F / U+205F 都在 0x80 以上，
+    // 不在这里拦就会留在紧凑视图里，把「ignore previous」拆成两段反而更
+    // 容易漏判；`isBlank` 定义在后面，Zig 允许前向引用。
+    if (isBlank(folded)) return null;
+    if (folded < 0x80) {
+        const byte: u8 = @intCast(folded);
+        return if (std.ascii.isAlphanumeric(byte)) std.ascii.toLower(byte) else null;
+    }
+    return if (isSymbolOrPunct(folded)) null else folded;
+}
+
+/// 形状视图的一个码点：全角折半角、同形字折拉丁、ASCII 小写化，标点与符号
+/// 原样保留——`http://`、`system:`、反引号这类标记靠形状本身识别，紧凑视图
+/// 会把它们压没。空白由调用点压成单个空格。
+fn shapedCodepoint(cp: u21) u21 {
+    const folded = foldHomoglyph(foldWidth(cp));
+    if (folded < 0x80) return std.ascii.toLower(@intCast(folded));
+    return folded;
+}
+
+/// 只保留最后 `tail.len` 个字节：标记都比窗口短，判定「刚喂进来的字符有没有
+/// 凑齐一个标记」只需要这段尾巴。整段文本因此是常数内存的线性扫描，多长的
+/// 标题都不会把栈撑爆。
+fn pushTail(tail: []u8, used: *usize, bytes: []const u8) void {
+    if (bytes.len >= tail.len) {
+        @memcpy(tail, bytes[bytes.len - tail.len ..]);
+        used.* = tail.len;
+        return;
+    }
+    if (used.* + bytes.len > tail.len) {
+        const drop = used.* + bytes.len - tail.len;
+        std.mem.copyForwards(u8, tail[0 .. used.* - drop], tail[drop..used.*]);
+        used.* -= drop;
+    }
+    @memcpy(tail[used.* .. used.* + bytes.len], bytes);
+    used.* += bytes.len;
+}
+
+/// 尾巴是否以任一标记结尾。标记的比对按「喂进来一个码点就看一眼」的方式做，
+/// 所以它等价于「这段文本里出现过这个（归一化后的）子串」。
+fn endsWithAny(tail: []const u8, markers: []const []const u8) bool {
+    for (markers) |marker| {
+        if (std.mem.endsWith(u8, tail, marker)) return true;
     }
     return false;
 }
 
+/// 折叠后仍长成词的标记，在紧凑视图上比对：词间空格、标点、全角与常见同形字
+/// 都已经吃掉了，所以拆开写的变体照样命中。中文只收「忽略 / 无视 + 前文」、
+/// 「你的新指令」「从现在起你」与「泄露系统提示」这几族；英文只收
+/// 「ignore / forget / disregard + previous / above」与「换系统提示」两族。
+///
+/// 宁可漏掉一种绕法，也不能把日常文案整条吞掉：`disregard`、`新的指令`、
+/// `系统指令`、`覆盖之前`、`忽略所有` 这类裸词每天都在正常标题里出现
+/// （「我 disregard 了他的建议」「Linux 常用系统指令合集」「我妈说忽略所有的
+/// 烦恼」），收进来只会把一条正常内容判成注入；它们必须带上「前文 / 系统提示
+/// 词」这类搭配才算数。
+const compact_markers = [_][]const u8{
+    "忽略之前", "忽略以上", "忽略前面", "忽略上述",
+    "无视之前", "无视以上", "无视上述", "无视前面",
+    "系统提示词", "你的新指令", "你现在扮演", "从现在起你", "从现在开始你",
+    "泄露提示词", "泄露系统提示",
+    "ignoreprevious", "ignoretheprevious", "ignoreabove", "ignoretheabove",
+    "ignoreallprevious", "ignorealltheprevious",
+    "forgetprevious", "forgetallprevious", "forgeteverything",
+    "disregardprevious", "disregardabove", "disregardallprevious",
+    "disregardtheprevious", "disregardtheabove",
+    "systemprompt", "developerprompt",
+};
+
+/// 形状本身就是特征的标记：冒号、斜杠、反引号、尖括号是它们的一部分，压成
+/// 紧凑视图就没了，所以单独在形状视图上比对。
+const shaped_markers = [_][]const u8{
+    "assistant:", "system:", "developer:", "javascript:", "data:text/html",
+    "http://", "https://", "<script", "```", "tool_call", "function_call",
+    "post /", "get /",
+};
+
+/// 这段桥接文本像不像提示词注入。两道判定：
+///
+/// 1. 任何一个看不见的字符（控制符、零宽、双向、标签字符……）本身就是可疑
+///    信号，直接命中；
+/// 2. 归一化之后再看两遍：紧凑视图上比对长成词的标记，形状视图上比对靠标点
+///    成形的标记。组合符（emoji 组合符、组合变音符）不参与投影——它们不承载
+///    字符，留在视图里只会把词拆开，让 `sys+ZWJ+tem:` 这种写法躲过 `system:`。
+///
+/// 两张视图都只是「比对用的投影」，从不展示、从不发送。写守门不读它们：它看
+/// 的是开关、目标 id 的格式与来源证明、目标的「可疑标记」，以及用户手写的正文
+/// （`bodyRefusal` 只判定、不改写）。
 fn looksLikeInjection(text: []const u8) bool {
+    if (text.len == 0) return false;
+    if (text.len > max_detect_bytes) return true;
     var view = std.unicode.Utf8View.init(text) catch return true;
     var iterator = view.iterator();
-    while (iterator.nextCodepoint()) |cp| {
-        if (isInvisible(cp)) return true;
-    }
-    const markers = [_][]const u8{
-        "忽略之前", "忽略以上", "忽略前面", "忽略上述", "无视之前", "系统提示", "系统指令",
-        "新的指令", "你现在是", "覆盖之前", "泄露提示", "ignore previous", "disregard",
-        "forget previous", "system prompt", "assistant:", "system:", "developer:",
-        "javascript:", "data:text/html", "http://", "https://", "<script", "tool_call",
-        "function_call", "```", "post /", "get /",
-    };
-    for (markers) |marker| {
-        if (containsIgnoreCase(text, marker)) return true;
+    var compact_tail: [marker_window]u8 = undefined;
+    var compact_used: usize = 0;
+    var shaped_tail: [marker_window]u8 = undefined;
+    var shaped_used: usize = 0;
+    var pending_space = false;
+    while (iterator.nextCodepoint()) |raw| {
+        if (isInvisible(raw)) return true;
+        if (isProjectionSkip(raw)) continue;
+        if (isBlank(foldWidth(raw))) {
+            // 置位而不是立刻写空格：连续空白在形状视图里只留一个空格，和
+            // `sanitize` 念出来的样子一致。
+            if (shaped_used > 0) pending_space = true;
+            continue;
+        }
+        var encoded: [4]u8 = undefined;
+        if (compactCodepoint(raw)) |cp| {
+            const size: usize = std.unicode.utf8Encode(cp, &encoded) catch 0;
+            pushTail(&compact_tail, &compact_used, encoded[0..size]);
+            if (endsWithAny(compact_tail[0..compact_used], &compact_markers)) return true;
+        }
+        const shaped = shapedCodepoint(raw);
+        if (pending_space) {
+            pushTail(&shaped_tail, &shaped_used, " ");
+            pending_space = false;
+        }
+        const size: usize = std.unicode.utf8Encode(shaped, &encoded) catch 0;
+        pushTail(&shaped_tail, &shaped_used, encoded[0..size]);
+        if (endsWithAny(shaped_tail[0..shaped_used], &shaped_markers)) return true;
     }
     return false;
 }
@@ -454,6 +670,142 @@ fn isInvisible(cp: u21) bool {
 /// not content either - a body made only of these would render as nothing.
 fn isCombiner(cp: u21) bool {
     return cp == 0x200D or (cp >= 0xFE00 and cp <= 0xFE0F);
+}
+
+/// 组合标记：Unicode `General_Category=Mark`（Mn / Mc / Me）的全部码点，按属性
+/// 数据生成、已排序且互不重叠。它们不承载独立字符，只决定前一个字形怎么画；留在
+/// 投影里就能把 `ignore` 拆成 `igno` + U+064E + `re`，让紧凑视图拼不出
+/// `ignoreprevious`、形状视图拼不出 `system:`。手抄区块表会漏掉泰文、老挝文、
+/// 藏文、缅甸文、高棉文这些能插在拉丁字母之间的标记，也会把同段里的可见标点
+/// 一起吞掉，所以这里直接收全量属性表，不做「主要区块」近似。
+///
+/// 只用于检测投影：`sanitize` 不删它们（那不是不可见字符），`bodyRefusal` 也不拦
+/// 用户手打的组合标记。
+fn isCombiningMark(cp: u21) bool {
+    var lo: usize = 0;
+    var hi: usize = mark_ranges.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const range = mark_ranges[mid];
+        if (cp < range[0]) {
+            hi = mid;
+        } else if (cp > range[1]) {
+            lo = mid + 1;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// `General_Category=Mark` 的全部区间（Unicode 18.0 属性数据，333 个区间）。表是照
+/// `extracted/DerivedGeneralCategory.txt` 里 Mn / Mc / Me 三段生成的，不是手挑区块。
+/// 下面列举的是 Unicode 18.0 相对 17.0 新增的**码点**（12 段、共 37 个）：U+05C8..
+/// U+05C9、U+0B53..U+0B54、U+1ADE..U+1ADF、U+1AEC..U+1AF0、U+10ECB..U+10ECF、
+/// U+10EF0..U+10EF9、U+11DF0、U+1D127..U+1D128、U+1D250..U+1D252、U+1D25B..U+1D25C、
+/// U+1D25F、U+1D280..U+1D281。表里有些区间是和 17.0 已有的相邻区**合并**成一条的，
+/// 所以不跟上面逐条对应：U+05C8..U+05C9 并进 `.{ 0x05C7, 0x05C9 }`，U+0B53..U+0B54
+/// 并进 `.{ 0x0B53, 0x0B57 }`，U+1ADE..U+1AF0 并进 `.{ 0x1AB0, 0x1AF0 }`，
+/// U+10EF0..U+10EF9 并进 `.{ 0x10EF0, 0x10EFF }`（紧接 17.0 已有的 U+10EFA..U+10EFF）。
+/// 写宽或写窄都算错：`test-plugin.ts` 按码点穷举表内每一段，并探每段两侧的相邻码点，
+/// 多收一个就会在「sys<cp>tem:」上误命中。下次 Unicode 再添 Mark，穷举 check 会点名
+/// 没覆盖到的码点，照着补进来即可。
+const mark_ranges = [_][2]u21{
+    .{ 0x0300, 0x036F }, .{ 0x0483, 0x0489 }, .{ 0x0591, 0x05BD }, .{ 0x05BF, 0x05BF },
+    .{ 0x05C1, 0x05C2 }, .{ 0x05C4, 0x05C5 }, .{ 0x05C7, 0x05C9 }, .{ 0x0610, 0x061A },
+    .{ 0x064B, 0x065F }, .{ 0x0670, 0x0670 }, .{ 0x06D6, 0x06DC }, .{ 0x06DF, 0x06E4 },
+    .{ 0x06E7, 0x06E8 }, .{ 0x06EA, 0x06ED }, .{ 0x0711, 0x0711 }, .{ 0x0730, 0x074A },
+    .{ 0x07A6, 0x07B0 }, .{ 0x07EB, 0x07F3 }, .{ 0x07FD, 0x07FD }, .{ 0x0816, 0x0819 },
+    .{ 0x081B, 0x0823 }, .{ 0x0825, 0x0827 }, .{ 0x0829, 0x082D }, .{ 0x0859, 0x085B },
+    .{ 0x0897, 0x089F }, .{ 0x08CA, 0x08E1 }, .{ 0x08E3, 0x0903 }, .{ 0x093A, 0x093C },
+    .{ 0x093E, 0x094F }, .{ 0x0951, 0x0957 }, .{ 0x0962, 0x0963 }, .{ 0x0981, 0x0983 },
+    .{ 0x09BC, 0x09BC }, .{ 0x09BE, 0x09C4 }, .{ 0x09C7, 0x09C8 }, .{ 0x09CB, 0x09CD },
+    .{ 0x09D7, 0x09D7 }, .{ 0x09E2, 0x09E3 }, .{ 0x09FE, 0x09FE }, .{ 0x0A01, 0x0A03 },
+    .{ 0x0A3C, 0x0A3C }, .{ 0x0A3E, 0x0A42 }, .{ 0x0A47, 0x0A48 }, .{ 0x0A4B, 0x0A4D },
+    .{ 0x0A51, 0x0A51 }, .{ 0x0A70, 0x0A71 }, .{ 0x0A75, 0x0A75 }, .{ 0x0A81, 0x0A83 },
+    .{ 0x0ABC, 0x0ABC }, .{ 0x0ABE, 0x0AC5 }, .{ 0x0AC7, 0x0AC9 }, .{ 0x0ACB, 0x0ACD },
+    .{ 0x0AE2, 0x0AE3 }, .{ 0x0AFA, 0x0AFF }, .{ 0x0B01, 0x0B03 }, .{ 0x0B3C, 0x0B3C },
+    .{ 0x0B3E, 0x0B44 }, .{ 0x0B47, 0x0B48 }, .{ 0x0B4B, 0x0B4D }, .{ 0x0B53, 0x0B57 },
+    .{ 0x0B62, 0x0B63 }, .{ 0x0B82, 0x0B82 }, .{ 0x0BBE, 0x0BC2 }, .{ 0x0BC6, 0x0BC8 },
+    .{ 0x0BCA, 0x0BCD }, .{ 0x0BD7, 0x0BD7 }, .{ 0x0C00, 0x0C04 }, .{ 0x0C3C, 0x0C3C },
+    .{ 0x0C3E, 0x0C44 }, .{ 0x0C46, 0x0C48 }, .{ 0x0C4A, 0x0C4D }, .{ 0x0C55, 0x0C56 },
+    .{ 0x0C62, 0x0C63 }, .{ 0x0C81, 0x0C83 }, .{ 0x0CBC, 0x0CBC }, .{ 0x0CBE, 0x0CC4 },
+    .{ 0x0CC6, 0x0CC8 }, .{ 0x0CCA, 0x0CCD }, .{ 0x0CD5, 0x0CD6 }, .{ 0x0CE2, 0x0CE3 },
+    .{ 0x0CF3, 0x0CF3 }, .{ 0x0D00, 0x0D03 }, .{ 0x0D3B, 0x0D3C }, .{ 0x0D3E, 0x0D44 },
+    .{ 0x0D46, 0x0D48 }, .{ 0x0D4A, 0x0D4D }, .{ 0x0D57, 0x0D57 }, .{ 0x0D62, 0x0D63 },
+    .{ 0x0D81, 0x0D83 }, .{ 0x0DCA, 0x0DCA }, .{ 0x0DCF, 0x0DD4 }, .{ 0x0DD6, 0x0DD6 },
+    .{ 0x0DD8, 0x0DDF }, .{ 0x0DF2, 0x0DF3 }, .{ 0x0E31, 0x0E31 }, .{ 0x0E34, 0x0E3A },
+    .{ 0x0E47, 0x0E4E }, .{ 0x0EB1, 0x0EB1 }, .{ 0x0EB4, 0x0EBC }, .{ 0x0EC8, 0x0ECE },
+    .{ 0x0F18, 0x0F19 }, .{ 0x0F35, 0x0F35 }, .{ 0x0F37, 0x0F37 }, .{ 0x0F39, 0x0F39 },
+    .{ 0x0F3E, 0x0F3F }, .{ 0x0F71, 0x0F84 }, .{ 0x0F86, 0x0F87 }, .{ 0x0F8D, 0x0F97 },
+    .{ 0x0F99, 0x0FBC }, .{ 0x0FC6, 0x0FC6 }, .{ 0x102B, 0x103E }, .{ 0x1056, 0x1059 },
+    .{ 0x105E, 0x1060 }, .{ 0x1062, 0x1064 }, .{ 0x1067, 0x106D }, .{ 0x1071, 0x1074 },
+    .{ 0x1082, 0x108D }, .{ 0x108F, 0x108F }, .{ 0x109A, 0x109D }, .{ 0x135D, 0x135F },
+    .{ 0x1712, 0x1715 }, .{ 0x1732, 0x1734 }, .{ 0x1752, 0x1753 }, .{ 0x1772, 0x1773 },
+    .{ 0x17B4, 0x17D3 }, .{ 0x17DD, 0x17DD }, .{ 0x180B, 0x180D }, .{ 0x180F, 0x180F },
+    .{ 0x1885, 0x1886 }, .{ 0x18A9, 0x18A9 }, .{ 0x1920, 0x192B }, .{ 0x1930, 0x193B },
+    .{ 0x1A17, 0x1A1B }, .{ 0x1A55, 0x1A5E }, .{ 0x1A60, 0x1A7C }, .{ 0x1A7F, 0x1A7F },
+    .{ 0x1AB0, 0x1AF0 }, .{ 0x1B00, 0x1B04 }, .{ 0x1B34, 0x1B44 }, .{ 0x1B6B, 0x1B73 },
+    .{ 0x1B80, 0x1B82 }, .{ 0x1BA1, 0x1BAD }, .{ 0x1BE6, 0x1BF3 }, .{ 0x1C24, 0x1C37 },
+    .{ 0x1CD0, 0x1CD2 }, .{ 0x1CD4, 0x1CE8 }, .{ 0x1CED, 0x1CED }, .{ 0x1CF4, 0x1CF4 },
+    .{ 0x1CF7, 0x1CF9 }, .{ 0x1DC0, 0x1DFF }, .{ 0x20D0, 0x20F0 }, .{ 0x2CEF, 0x2CF1 },
+    .{ 0x2D7F, 0x2D7F }, .{ 0x2DE0, 0x2DFF }, .{ 0x302A, 0x302F }, .{ 0x3099, 0x309A },
+    .{ 0xA66F, 0xA672 }, .{ 0xA674, 0xA67D }, .{ 0xA69E, 0xA69F }, .{ 0xA6F0, 0xA6F1 },
+    .{ 0xA802, 0xA802 }, .{ 0xA806, 0xA806 }, .{ 0xA80B, 0xA80B }, .{ 0xA823, 0xA827 },
+    .{ 0xA82C, 0xA82C }, .{ 0xA880, 0xA881 }, .{ 0xA8B4, 0xA8C5 }, .{ 0xA8E0, 0xA8F1 },
+    .{ 0xA8FF, 0xA8FF }, .{ 0xA926, 0xA92D }, .{ 0xA947, 0xA953 }, .{ 0xA980, 0xA983 },
+    .{ 0xA9B3, 0xA9C0 }, .{ 0xA9E5, 0xA9E5 }, .{ 0xAA29, 0xAA36 }, .{ 0xAA43, 0xAA43 },
+    .{ 0xAA4C, 0xAA4D }, .{ 0xAA7B, 0xAA7D }, .{ 0xAAB0, 0xAAB0 }, .{ 0xAAB2, 0xAAB4 },
+    .{ 0xAAB7, 0xAAB8 }, .{ 0xAABE, 0xAABF }, .{ 0xAAC1, 0xAAC1 }, .{ 0xAAEB, 0xAAEF },
+    .{ 0xAAF5, 0xAAF6 }, .{ 0xABE3, 0xABEA }, .{ 0xABEC, 0xABED }, .{ 0xFB1E, 0xFB1E },
+    .{ 0xFE00, 0xFE0F }, .{ 0xFE20, 0xFE2F }, .{ 0x101FD, 0x101FD }, .{ 0x102E0, 0x102E0 },
+    .{ 0x10376, 0x1037A }, .{ 0x10A01, 0x10A03 }, .{ 0x10A05, 0x10A06 }, .{ 0x10A0C, 0x10A0F },
+    .{ 0x10A38, 0x10A3A }, .{ 0x10A3F, 0x10A3F }, .{ 0x10AE5, 0x10AE6 }, .{ 0x10D24, 0x10D27 },
+    .{ 0x10D69, 0x10D6D }, .{ 0x10EAB, 0x10EAC }, .{ 0x10ECB, 0x10ECF }, .{ 0x10EF0, 0x10EFF },
+    .{ 0x10F46, 0x10F50 }, .{ 0x10F82, 0x10F85 }, .{ 0x11000, 0x11002 }, .{ 0x11038, 0x11046 },
+    .{ 0x11070, 0x11070 }, .{ 0x11073, 0x11074 }, .{ 0x1107F, 0x11082 }, .{ 0x110B0, 0x110BA },
+    .{ 0x110C2, 0x110C2 }, .{ 0x11100, 0x11102 }, .{ 0x11127, 0x11134 }, .{ 0x11145, 0x11146 },
+    .{ 0x11173, 0x11173 }, .{ 0x11180, 0x11182 }, .{ 0x111B3, 0x111C0 }, .{ 0x111C9, 0x111CC },
+    .{ 0x111CE, 0x111CF }, .{ 0x1122C, 0x11237 }, .{ 0x1123E, 0x1123E }, .{ 0x11241, 0x11241 },
+    .{ 0x112DF, 0x112EA }, .{ 0x11300, 0x11303 }, .{ 0x1133B, 0x1133C }, .{ 0x1133E, 0x11344 },
+    .{ 0x11347, 0x11348 }, .{ 0x1134B, 0x1134D }, .{ 0x11357, 0x11357 }, .{ 0x11362, 0x11363 },
+    .{ 0x11366, 0x1136C }, .{ 0x11370, 0x11374 }, .{ 0x113B8, 0x113C0 }, .{ 0x113C2, 0x113C2 },
+    .{ 0x113C5, 0x113C5 }, .{ 0x113C7, 0x113CA }, .{ 0x113CC, 0x113D0 }, .{ 0x113D2, 0x113D2 },
+    .{ 0x113E1, 0x113E2 }, .{ 0x11435, 0x11446 }, .{ 0x1145E, 0x1145E }, .{ 0x114B0, 0x114C3 },
+    .{ 0x115AF, 0x115B5 }, .{ 0x115B8, 0x115C0 }, .{ 0x115DC, 0x115DD }, .{ 0x11630, 0x11640 },
+    .{ 0x116AB, 0x116B7 }, .{ 0x1171D, 0x1172B }, .{ 0x1182C, 0x1183A }, .{ 0x11930, 0x11935 },
+    .{ 0x11937, 0x11938 }, .{ 0x1193B, 0x1193E }, .{ 0x11940, 0x11940 }, .{ 0x11942, 0x11943 },
+    .{ 0x119D1, 0x119D7 }, .{ 0x119DA, 0x119E0 }, .{ 0x119E4, 0x119E4 }, .{ 0x11A01, 0x11A0A },
+    .{ 0x11A33, 0x11A39 }, .{ 0x11A3B, 0x11A3E }, .{ 0x11A47, 0x11A47 }, .{ 0x11A51, 0x11A5B },
+    .{ 0x11A8A, 0x11A99 }, .{ 0x11B60, 0x11B67 }, .{ 0x11C2F, 0x11C36 }, .{ 0x11C38, 0x11C3F },
+    .{ 0x11C92, 0x11CA7 }, .{ 0x11CA9, 0x11CB6 }, .{ 0x11D31, 0x11D36 }, .{ 0x11D3A, 0x11D3A },
+    .{ 0x11D3C, 0x11D3D }, .{ 0x11D3F, 0x11D45 }, .{ 0x11D47, 0x11D47 }, .{ 0x11D8A, 0x11D8E },
+    .{ 0x11D90, 0x11D91 }, .{ 0x11D93, 0x11D97 }, .{ 0x11DF0, 0x11DF0 }, .{ 0x11EF3, 0x11EF6 },
+    .{ 0x11F00, 0x11F01 }, .{ 0x11F03, 0x11F03 }, .{ 0x11F34, 0x11F3A }, .{ 0x11F3E, 0x11F42 },
+    .{ 0x11F5A, 0x11F5A }, .{ 0x13440, 0x13440 }, .{ 0x13447, 0x13455 }, .{ 0x1611E, 0x1612F },
+    .{ 0x16AF0, 0x16AF4 }, .{ 0x16B30, 0x16B36 }, .{ 0x16F4F, 0x16F4F }, .{ 0x16F51, 0x16F87 },
+    .{ 0x16F8F, 0x16F92 }, .{ 0x16FE4, 0x16FE4 }, .{ 0x16FF0, 0x16FF1 }, .{ 0x1BC9D, 0x1BC9E },
+    .{ 0x1CF00, 0x1CF2D }, .{ 0x1CF30, 0x1CF46 }, .{ 0x1D127, 0x1D128 }, .{ 0x1D165, 0x1D169 },
+    .{ 0x1D16D, 0x1D172 }, .{ 0x1D17B, 0x1D182 }, .{ 0x1D185, 0x1D18B }, .{ 0x1D1AA, 0x1D1AD },
+    .{ 0x1D242, 0x1D244 }, .{ 0x1D250, 0x1D252 }, .{ 0x1D25B, 0x1D25C }, .{ 0x1D25F, 0x1D25F },
+    .{ 0x1D280, 0x1D281 }, .{ 0x1DA00, 0x1DA36 }, .{ 0x1DA3B, 0x1DA6C }, .{ 0x1DA75, 0x1DA75 },
+    .{ 0x1DA84, 0x1DA84 }, .{ 0x1DA9B, 0x1DA9F }, .{ 0x1DAA1, 0x1DAAF }, .{ 0x1E000, 0x1E006 },
+    .{ 0x1E008, 0x1E018 }, .{ 0x1E01B, 0x1E021 }, .{ 0x1E023, 0x1E024 }, .{ 0x1E026, 0x1E02A },
+    .{ 0x1E08F, 0x1E08F }, .{ 0x1E130, 0x1E136 }, .{ 0x1E2AE, 0x1E2AE }, .{ 0x1E2EC, 0x1E2EF },
+    .{ 0x1E4EC, 0x1E4EF }, .{ 0x1E5EE, 0x1E5EF }, .{ 0x1E6E3, 0x1E6E3 }, .{ 0x1E6E6, 0x1E6E6 },
+    .{ 0x1E6EE, 0x1E6EF }, .{ 0x1E6F5, 0x1E6F5 }, .{ 0x1E8D0, 0x1E8D6 }, .{ 0x1E944, 0x1E94A },
+    .{ 0xE0100, 0xE01EF },
+
+};
+
+/// 检测投影里整个跳过的码点：emoji 组合符与组合标记都不承载字符，只改前一个
+/// 字符的字形。留在视图里会白白把词拆开——`sys` 夹一个 ZWJ 再接 `tem:` 时，
+/// 紧凑视图只剩半截词（ZWJ 被标点过滤掉，`systemprompt` 这类标记拼不出来），
+/// 形状视图又因为多出那个 ZWJ 拼不出 `system:`。跳过之后两张视图都回到「人眼
+/// 看到的那个词」。只用于检测投影：`sanitize` 保留组合符（emoji 才不会散架），
+/// `bodyRefusal` 放行用户手打的组合符，两者都不经过这里。
+fn isProjectionSkip(cp: u21) bool {
+    return isCombiner(cp) or isCombiningMark(cp);
 }
 
 /// Whitespace, including the Unicode space separators. `bodyRefusal` uses it to
@@ -922,6 +1274,63 @@ fn settleClock(ctx: *dfy.Context) !void {
 // 快照：本次抓取留下的候选与来源证明
 // ---------------------------------------------------------------------------
 
+/// 可疑标记与 `peek` 副本一起写。标记对正文和作者名各算一次，任一命中整条
+/// 算可疑；命中时再分开记 `suspectBody` / `suspectAuthor`，`peek` 才知道该把
+/// 哪一部分当可疑内容标出来——副本截到 200 字，标记可能正好落在截断之外，
+/// 只靠副本重扫会漏。作者名的播报副本只有 24 字（`Guard.max_author`），命中
+/// 点完全可能在其后，所以作者名也单独留一份 200 字净本（`peekAuthor`）：
+/// 否则 `peek` 会念一段干净前缀，用户看不到触发原因。
+/// 副本还要受 `Snapshot.peek_budget_bytes` 总量约束：先到先得，超出预算的可疑
+/// 节点只留标记，不再堆副本。
+fn writeSuspect(writer: *dfy.Json, raw_text: []const u8, raw_author: []const u8) !void {
+    const body_suspect = looksLikeInjection(raw_text);
+    const author_suspect = looksLikeInjection(raw_author);
+    try writer.key("suspect");
+    try writer.boolean(body_suspect or author_suspect);
+    if (!body_suspect and !author_suspect) return;
+    try writer.key("suspectBody");
+    try writer.boolean(body_suspect);
+    try writer.key("suspectAuthor");
+    try writer.boolean(author_suspect);
+    if (body_suspect and raw_text.len != 0) {
+        var peek_buffer: [Snapshot.peek_chars * 4]u8 = undefined;
+        const peek_text = sanitize(&peek_buffer, raw_text, Snapshot.peek_chars);
+        const cost = jsonStringLength(peek_text);
+        if (peek_budget_used + cost <= Snapshot.peek_budget_bytes) {
+            peek_budget_used += cost;
+            try writer.key("peekText");
+            try writer.str(peek_text);
+        }
+    }
+    if (author_suspect and raw_author.len != 0) {
+        var peek_author_buffer: [Snapshot.peek_chars * 4]u8 = undefined;
+        const peek_author = sanitize(&peek_author_buffer, raw_author, Snapshot.peek_chars);
+        const cost = jsonStringLength(peek_author);
+        if (peek_budget_used + cost <= Snapshot.peek_budget_bytes) {
+            peek_budget_used += cost;
+            try writer.key("peekAuthor");
+            try writer.str(peek_author);
+        }
+    }
+}
+
+/// `Json.writeString` 会给引号、反斜杠与控制字符加转义。写入副本前先按同样
+/// 规则估算输出长度，快照预算才不会被不可见字符悄悄撑爆。
+fn jsonStringLength(text: []const u8) usize {
+    var length: usize = 2;
+    for (text) |byte| {
+        length += switch (byte) {
+            '"', '\\' => 2,
+            '\n', '\r', '\t', 0x08, 0x0c => 2,
+            else => if (byte < 0x20) 6 else 1,
+        };
+    }
+    return length;
+}
+
+/// 只在写本轮快照时使用；每次重建快照前清零，防上一次调用的账本漏进来。
+var peek_budget_used: usize = 0;
+
 fn writeSnapshotReply(writer: *dfy.Json, item: dfy.Value) !void {
     const raw_text = dfy.getStr(item, "text") orelse "";
     const raw_author = dfy.getStr(item, "author") orelse "";
@@ -934,8 +1343,7 @@ fn writeSnapshotReply(writer: *dfy.Json, item: dfy.Value) !void {
     try writer.str(sanitize(&author_buffer, raw_author, Guard.max_author));
     try writer.key("text");
     try writer.str(sanitize(&text_buffer, raw_text, Guard.max_feed_text));
-    try writer.key("suspect");
-    try writer.boolean(looksLikeInjection(raw_text) or looksLikeInjection(raw_author));
+    try writeSuspect(writer, raw_text, raw_author);
     try writer.endObject();
 }
 
@@ -951,8 +1359,7 @@ fn writeSnapshotComment(writer: *dfy.Json, item: dfy.Value) !void {
     try writer.str(sanitize(&author_buffer, raw_author, Guard.max_author));
     try writer.key("text");
     try writer.str(sanitize(&text_buffer, raw_text, Guard.max_feed_text));
-    try writer.key("suspect");
-    try writer.boolean(looksLikeInjection(raw_text) or looksLikeInjection(raw_author));
+    try writeSuspect(writer, raw_text, raw_author);
     try writer.key("replies");
     try writer.beginArray();
     var kept: usize = 0;
@@ -970,7 +1377,8 @@ fn writeSnapshotComment(writer: *dfy.Json, item: dfy.Value) !void {
 }
 
 /// 一条视频进快照：只保留可用 id、可念文本与一个「疑似注入」标记。
-/// 标题/作者不可疑不代表评论区可信，所以标记是逐条算的。
+/// 标题/作者不可疑不代表评论区可信，所以标记是逐条算的；被标记的条目另外
+/// 留一份 200 字的净化副本供 `peek`，正常条目只有 60 字的播报副本。
 fn writeSnapshotItem(writer: *dfy.Json, item: dfy.Value) !void {
     const raw_title = dfy.getStr(item, "title") orelse "";
     const raw_author = dfy.getStr(item, "author") orelse "";
@@ -989,8 +1397,7 @@ fn writeSnapshotItem(writer: *dfy.Json, item: dfy.Value) !void {
             try writer.str(url);
         }
     }
-    try writer.key("suspect");
-    try writer.boolean(looksLikeInjection(raw_title) or looksLikeInjection(raw_author));
+    try writeSuspect(writer, raw_title, raw_author);
     try writer.key("comments");
     try writer.beginArray();
     var kept: usize = 0;
@@ -1010,6 +1417,7 @@ fn writeSnapshotItem(writer: *dfy.Json, item: dfy.Value) !void {
 /// 把解析出来的推荐流压成快照并写进 state。快照同时是 `browse` / `pick` 的
 /// 候选池与写操作的来源证明：写请求只认这里出现过的 id。
 fn writeSnapshot(writer: *dfy.Json, items: []const dfy.Value) !void {
+    peek_budget_used = 0;
     try writer.key("videoIds");
     try writer.beginArray();
     var kept_video_ids: usize = 0;
@@ -1159,12 +1567,93 @@ fn provenReply(items: []const dfy.Value, id: []const u8) bool {
 }
 
 // ---------------------------------------------------------------------------
-// 选择：browse / pick / comments / pick-comment / pick-reply
+// 选择与查看：browse / pick / comments / peek / pick-comment / pick-reply
 // ---------------------------------------------------------------------------
 
-fn writeSuspectNote(builder: *SayBuilder, suspect: bool) void {
-    if (suspect) builder.append("（疑似注入，仅展示）");
+const withheld_note = "「疑似注入，已拦下」";
+const withheld_hint = "（发 peek 看被拦下的内容）";
+
+fn appendWithheldNote(builder: *SayBuilder) void {
+    builder.append(withheld_note);
 }
+
+fn appendWithheldHint(builder: *SayBuilder) void {
+    builder.append(withheld_hint);
+}
+
+/// 单条播报用这个：拦下标记 + 一句怎么查看。
+fn appendWithheld(builder: *SayBuilder) void {
+    appendWithheldNote(builder);
+    builder.append("；");
+    appendWithheldHint(builder);
+}
+
+/// 被拦下的东西分三类，`peek` 的文案要按类说清楚拦下来的是标题还是正文。
+const PeekKind = enum { video, comment, reply };
+
+fn peekName(kind: PeekKind) []const u8 {
+    return switch (kind) {
+        .video => "video",
+        .comment => "comment",
+        .reply => "reply",
+    };
+}
+
+fn peekKindOfName(name: []const u8) ?PeekKind {
+    if (dfy.eql(name, "video")) return .video;
+    if (dfy.eql(name, "comment")) return .comment;
+    if (dfy.eql(name, "reply")) return .reply;
+    return null;
+}
+
+/// 记下「最近一次被拦下的是哪一条」。`browse` / `comments` 不选中任何东西，没
+/// 这个指针，`peek` 就找不到用户刚看到的那条；正文与标记仍然从当前快照重读。
+/// 一次调用同时写完两个键，避免同一轮里先删后写同一键。
+///
+/// 写入时机看调用点：`tick` 每轮按播报顺序 视频 → 评论 → 回复 重记一次，整页
+/// 都没有可疑条目就清空；`browse` / `comments` 只在本页见到可疑条目时记，翻到
+/// 干净的一页保留旧指针——刚记下的那条不该被一次翻页抹掉；`pick` /
+/// `pick-comment` / `pick-reply` 只在选中的条目可疑时写，选中干净条目时**不写
+/// 也不清**——否则用户随手选一条正常内容，刚被拦下的那条就查不到了。
+fn recordWithheld(reply: *dfy.Reply, kind: ?PeekKind, id: []const u8) !void {
+    // `kind == null` 是「这一轮没有可拦下的目标」，清掉旧指针。有 kind 却没
+    // 有 id 是调用点自己没取到 id：写不出有效指针，也不该顺手把上一轮还查得到
+    // 的那条清掉——宁可不写，让 `peek` 退回全层扫描。
+    const value = kind orelse {
+        try reply.stateRemove("withheldKind");
+        try reply.stateRemove("withheldId");
+        return;
+    };
+    if (id.len == 0) return;
+    try reply.stateStr("withheldKind", peekName(value));
+    try reply.stateStr("withheldId", id);
+}
+
+/// `browse` / `comments` 都只把**本页第一条**可疑条目留给 `peek`：后面的照样
+/// 标成「已拦下」，但不再抢指针；提示也只在列表末尾补一次。两处记账逻辑一样，
+/// 抽出来免得各自漏掉一个分支。
+const WithheldList = struct {
+    any: bool = false,
+    kind: ?PeekKind = null,
+    id: []const u8 = "",
+
+    fn note(self: *WithheldList, item: dfy.Value, kind: PeekKind) void {
+        self.any = true;
+        if (self.kind != null) return;
+        self.kind = kind;
+        self.id = dfy.getStr(item, "id") orelse "";
+    }
+
+    fn appendHint(self: *const WithheldList, builder: *SayBuilder) void {
+        if (!self.any) return;
+        builder.append("；");
+        appendWithheldHint(builder);
+    }
+
+    fn record(self: *const WithheldList, reply: *dfy.Reply) !void {
+        if (self.kind) |kind| try recordWithheld(reply, kind, self.id);
+    }
+};
 
 /// 游标从 -1 起步，每次 +1 取模：第一次 `pick` 落在第 1 条，重复调用就是
 /// 「下一条」。带 `args.index`（1 起）则直接定位，越界返回 null 而不是绕回，
@@ -1188,6 +1677,8 @@ fn argIndex(event: dfy.Value) ?i64 {
 
 fn clearReplySelection(reply: *dfy.Reply) !void {
     try reply.stateRemove("lastReplyId");
+    // `lastReplyAuthor` / `lastReplyText` / `lastReplySuspect` 是 0.4.x 写下的
+    // 副本，0.5.1 起改为每次回快照重读，这里保留删除只为清掉旧版本残留。
     try reply.stateRemove("lastReplyAuthor");
     try reply.stateRemove("lastReplyText");
     try reply.stateRemove("lastReplySuspect");
@@ -1196,6 +1687,7 @@ fn clearReplySelection(reply: *dfy.Reply) !void {
 
 fn clearCommentSelection(reply: *dfy.Reply) !void {
     try reply.stateRemove("lastCommentId");
+    // 同上：评论正文与标记的副本已不再写入，只清理旧版本留下的键。
     try reply.stateRemove("lastCommentAuthor");
     try reply.stateRemove("lastCommentText");
     try reply.stateRemove("lastCommentSuspect");
@@ -1236,28 +1728,46 @@ fn commandBrowse(ctx: *dfy.Context, counter: i64, index_arg: ?i64) !void {
     if (std.fmt.bufPrint(&head_buffer, "推荐流 {d}-{d}/{d}：", .{ start + 1, stop, videos.len })) |head| {
         builder.append(head);
     } else |_| {}
+    // `browse` 不选中任何东西，被拦下的条目要当场记下来，`peek` 才有目标；
+    // 只记本页第一条，后面的可疑条目照样列出来，但不再抢 `peek` 的位置。
+    var withheld = WithheldList{};
     var index = start;
     while (index < stop) : (index += 1) {
         const item = videos[index];
         const title = dfy.getStr(item, "title") orelse "";
         const author = dfy.getStr(item, "author") orelse "";
-        var entry_buffer: [240]u8 = undefined;
-        const entry = std.fmt.bufPrint(
-            &entry_buffer,
-            "{d}.「{s}」@{s}",
-            .{
-                index + 1,
-                if (title.len == 0) @as([]const u8, "（无标题）") else title,
-                if (author.len == 0) @as([]const u8, "未知作者") else author,
-            },
-        ) catch continue;
-        builder.append(entry);
-        if (dfy.getBool(item, "suspect") orelse false) builder.append("（疑似注入，仅展示）");
+        const suspect = dfy.getBool(item, "suspect") orelse false;
+        var index_buffer: [24]u8 = undefined;
+        const prefix = std.fmt.bufPrint(&index_buffer, "{d}.", .{index + 1}) catch continue;
+        if (suspect) {
+            builder.append(prefix);
+            appendWithheldNote(&builder);
+            withheld.note(item, .video);
+        } else {
+            // 标题 60 字、作者 24 字都是**字**不是字节：最坏 4 字节一个码点，
+            // 加上「」与 `@`，240 + 96 + 6 = 342 字节。按这个上限留足，否则
+            // `bufPrint` 失败会让前缀变成孤零零的序号。
+            var entry_buffer: [Guard.max_feed_text * 4 + Guard.max_author * 4 + 16]u8 = undefined;
+            const entry = std.fmt.bufPrint(
+                &entry_buffer,
+                "「{s}」@{s}",
+                .{
+                    if (title.len == 0) @as([]const u8, "（无标题）") else title,
+                    if (author.len == 0) @as([]const u8, "未知作者") else author,
+                },
+            ) catch continue;
+            builder.append(prefix);
+            builder.append(entry);
+        }
         if (index + 1 < stop) builder.append("；");
     }
+    withheld.appendHint(&builder);
     try reply.say(builder.slice());
     reply.status(builder.slice(), null, counter);
     try reply.stateInt("browsePage", @intCast(page));
+    // 这一页没有可疑条目就保持上一次的指针不动：翻页翻到干净的一页，不该顺手
+    // 把刚记下的那条清掉。
+    try withheld.record(reply);
 }
 
 fn commandComments(ctx: *dfy.Context, counter: i64) !void {
@@ -1276,28 +1786,341 @@ fn commandComments(ctx: *dfy.Context, counter: i64) !void {
     }
     var builder = SayBuilder{};
     builder.append("评论区：");
+    var withheld = WithheldList{};
     var index: usize = 0;
     while (index < comments.len) : (index += 1) {
         const item = comments[index];
         const text = dfy.getStr(item, "text") orelse "";
         const author = dfy.getStr(item, "author") orelse "";
-        var entry_buffer: [280]u8 = undefined;
-        const entry = std.fmt.bufPrint(
-            &entry_buffer,
-            "{d}.「{s}」@{s}",
-            .{
-                index + 1,
-                if (text.len == 0) @as([]const u8, "（空）") else text,
-                if (author.len == 0) @as([]const u8, "未知作者") else author,
-            },
-        ) catch continue;
-        builder.append(entry);
-        if (dfy.getBool(item, "suspect") orelse false) builder.append("（疑似注入，仅展示）");
+        const suspect = dfy.getBool(item, "suspect") orelse false;
+        var index_buffer: [24]u8 = undefined;
+        const prefix = std.fmt.bufPrint(&index_buffer, "{d}.", .{index + 1}) catch continue;
+        if (suspect) {
+            builder.append(prefix);
+            appendWithheldNote(&builder);
+            withheld.note(item, .comment);
+        } else {
+            // 评论正文准入上限是 300 字节，作者名 24 字最坏 96 字节，再加
+            // 「」与 `@`。留足后 `bufPrint` 不会失败，序号也就不会落单。
+            var entry_buffer: [Snapshot.max_comment_bytes + Guard.max_author * 4 + 16]u8 = undefined;
+            const entry = std.fmt.bufPrint(
+                &entry_buffer,
+                "「{s}」@{s}",
+                .{
+                    if (text.len == 0) @as([]const u8, "（空）") else text,
+                    if (author.len == 0) @as([]const u8, "未知作者") else author,
+                },
+            ) catch continue;
+            builder.append(prefix);
+            builder.append(entry);
+        }
         if (index + 1 < comments.len) builder.append("；");
     }
+    withheld.appendHint(&builder);
     try reply.say(builder.slice());
     reply.status(builder.slice(), null, counter);
     try clearCommentSelection(reply);
+    try withheld.record(reply);
+}
+
+/// `peek` 的候选目标：正文按条目类型兜底，作者统一兜底成「未知作者」。
+/// `body_suspect` / `author_suspect` 分开记，因为作者名单独中招时念法不同：
+/// 正文照常引，作者名要单独标成「作者名」而不是当成正文的一部分。
+const PeekTarget = struct {
+    kind: PeekKind,
+    label: []const u8,
+    text: []const u8,
+    author: []const u8,
+    body_suspect: bool,
+    author_suspect: bool,
+    /// `body_suspect or author_suspect`，外加快照自己记的标记：快照副本已经
+    /// 截过，标记可能正好落在截断之外，不能因为副本没再命中就把它当正常内容。
+    suspect: bool,
+};
+
+fn peekLabel(kind: PeekKind) []const u8 {
+    return switch (kind) {
+        .video => "视频标题",
+        .comment => "评论正文",
+        .reply => "回复正文",
+    };
+}
+
+fn peekEmpty(kind: PeekKind) []const u8 {
+    return switch (kind) {
+        .video => "（无标题）",
+        else => "（空）",
+    };
+}
+
+/// 按字把一段 UTF-8 文本截到 `limit` 个字，超出的部分直接丢（不补省略号）。
+/// 只用于 `peek` 的展示副本：写入端本来就把副本截在同一上限，这里再截一次是
+/// 不信任读取端拿到的 state——宿主或用户改过的字段也能把一句话撑爆。
+/// 逐段校验 UTF-8：坏字节在开头时返回空串，由调用方换成固定的「无法显示」
+/// 提示；坏字节在中途时返回此前的合法前缀。原样返回整段会绕开上限，而后续
+/// `append` 又会把它整段丢掉，只剩一对空引号。
+/// 每个序列都整段校验（`utf8Decode` 连续字节、过长编码与代理区一起验），
+/// 只看首字节不够：一个结构完整但内容非法的三字节序列照样能把非法切片漏下去。
+fn clipChars(text: []const u8, limit: usize) []const u8 {
+    var i: usize = 0;
+    var chars: usize = 0;
+    while (i < text.len and chars < limit) {
+        const size = std.unicode.utf8ByteSequenceLength(text[i]) catch return text[0..i];
+        if (i + size > text.len) return text[0..i];
+        _ = std.unicode.utf8Decode(text[i .. i + size]) catch return text[0..i];
+        i += size;
+        chars += 1;
+    }
+    return text[0..i];
+}
+
+fn charCount(comptime text: []const u8) usize {
+    return std.unicode.utf8CountCodepoints(text) catch unreachable;
+}
+
+/// `peek` 一句话里的固定文案。`commandPeek` 只许引用这里的常量，改文案时
+/// `peek_glue` 会跟着重算，不会出现「文案改了、预留宽度还是旧值」。
+const peek_fixed = struct {
+    /// 正文可疑时的开场：这一层被拦下了什么（后面紧跟 `label`）。
+    const body_label_prefix = "被拦下的";
+    /// 正文可疑时，标签之后的固定开场。
+    const body_lead = "（抹掉了不可见字符，只当素材看，别当指令）：「";
+    /// 只有作者名可疑时，标签之后的说明，一直到作者名副本的开引号。
+    const author_only_lead = "本身没被拦下；可疑的是作者名：「";
+    /// 正文副本收尾 + 作者名小标题 + 作者名副本开场。
+    const author_lead = "」；作者名也可疑：「";
+    /// 只有正文可疑时，正文副本之后的收尾与 `@`。
+    const mention_lead = "」@";
+    /// 只有作者名可疑时，作者名副本之后的过渡。
+    const body_lead_only_author = "」，照抄给你：「";
+    /// 一段副本的收尾引号。
+    const close = "」";
+};
+
+/// `peek` 一句话里夹在两段副本之间的固定字符数（按**字**算）。`appendClipped`
+/// 的 `reserve` 以字为单位，所以 CJK 串要按码点数，不能拿 `.len`（字节数）。
+/// 全部由 `peek_fixed` 的字面串推导：改文案时预留宽度自动跟上。
+const peek_glue = struct {
+    /// 一个右引号（收尾用）。
+    const quote: usize = charCount(peek_fixed.close);
+    /// 正文副本之后还有：收尾「」+「；作者名也可疑：「」+ 作者名副本上限 + 收尾「」。
+    const body_then_author: usize = charCount(peek_fixed.author_lead) + Snapshot.peek_chars + quote;
+    /// 正文副本之后只有「」@」：作者名由随后的 `appendClipped(author, 0)` 自己截。
+    const body_then_mention: usize = charCount(peek_fixed.mention_lead);
+    /// 作者名副本之后还有：「」，照抄给你：「」+ 正文副本上限 + 收尾「」。
+    const author_then_body: usize = charCount(peek_fixed.body_lead_only_author) + Snapshot.peek_chars + quote;
+};
+
+comptime {
+    // 最紧的两条分支：固定骨架 + 另一段 200 字副本之后，正文（或作者名）
+    // 仍要留得下一段可辨认的内容，不能只剩一个「…」。
+    const label_max = 4; // 「视频标题」「评论正文」「回复正文」
+    const body_prefix = charCount(peek_fixed.body_label_prefix) + label_max + charCount(peek_fixed.body_lead);
+    if (SayBuilder.max_chars - body_prefix - peek_glue.body_then_author < 20) {
+        @compileError("peek 两段都可疑时正文预算过窄");
+    }
+    const author_prefix = label_max + charCount(peek_fixed.author_only_lead);
+    if (SayBuilder.max_chars - author_prefix - peek_glue.author_then_body < 20) {
+        @compileError("peek 只作者名可疑时作者名预算过窄");
+    }
+    // 第三条分支（正文可疑、作者名干净）撑不满 400，但要保证正文副本之后
+    // 的「」@」一定留在句子里，作者名才不会被挤成空。
+    const mention_prefix = body_prefix + Snapshot.peek_chars;
+    if (mention_prefix + peek_glue.body_then_mention > SayBuilder.max_chars) {
+        @compileError("peek 只有正文可疑时收尾「」@」放不下");
+    }
+}
+
+/// `peek` 副本不是合法 UTF-8 时的占位说明（宿主或用户改坏了 state）。
+const peek_unreadable = "（副本不是合法 UTF-8，无法显示）";
+
+/// `peek` 读的正文：可疑条目在快照里另存了一份更长的净化文本（`peekText`），
+/// 正常条目只有播报用的那份（`text`）。两份都过过 `sanitize`，所以念出来
+/// 不带不可见字符——这里给的是「被拦下的那句话」，不是原始字节。`peek` 这个
+/// 旧键名是字段与命令撞名的遗留，0.5.0 的快照里还可能有，读一次兜底。
+///
+/// 视频条目从来只写 `title`，升级前的快照也没有上面三个副本键：这时必须退回
+/// 标题，否则会一边说「拦下的是视频标题」一边念「（无标题）」，把它自己说成
+/// 什么都没拦下。评论与回复没有这个兜底——它们的正文键就是 `text`。
+fn peekBody(item: dfy.Value, kind: PeekKind) []const u8 {
+    if (dfy.getStr(item, "peekText")) |body| return body;
+    if (dfy.getStr(item, "peek")) |body| return body;
+    if (dfy.getStr(item, "text")) |body| return body;
+    if (kind == .video) return dfy.getStr(item, "title") orelse "";
+    return "";
+}
+
+/// 从快照里的一条拼出 `peek` 目标。快照里的标记是**抓取那一刻**用完整原文算
+/// 的，比截过的副本可靠：写入时分开记的 `suspectBody` / `suspectAuthor` 优先。
+/// 副本只有前 60 字（播报用）与前 200 字（`peek` 用），命中点可能落在副本之外，
+/// 所以存下来的 `true` 一律按可疑保留——它是按完整原文算出来的，把它当噪声忽略
+/// 只会放过副本外面的注入。重扫副本只能**补**上漏标的命中，不能用来否定抓取时的
+/// 结论。
+///
+/// 旧快照缺拆分字段时没有「正文可疑 / 作者可疑」的分工——作者名可疑并不排除
+/// 正文也可疑，正文副本又可能截在命中点之前——所以只能退回「整条可疑即正文也可
+/// 疑」：宁可多标一句被拦下，也不能反过来断言「正文本身没被拦下」。
+///
+/// 判定读原文，展示只读截到 `Snapshot.peek_chars` 的副本：`say` 一句话 400 字，
+/// 两段副本各自最多 200 字，骨架再挤就念不下了。写入端本来就把副本截在同一
+/// 上限，这里重截是为了不让被改过的 state（宿主或用户本人）把 `peek` 撑爆。
+fn peekTargetOf(item: dfy.Value, kind: PeekKind) ?PeekTarget {
+    if (item != .object) return null;
+    const raw_body = peekBody(item, kind);
+    // 作者名优先读可疑时另存的 200 字副本：播报副本只有 24 字，命中点可能
+    // 落在其后。旧快照没有 `peekAuthor`，退回 24 字的 `author`。
+    const raw_author = dfy.getStr(item, "peekAuthor") orelse dfy.getStr(item, "author") orelse "";
+    const stored = dfy.getBool(item, "suspect") orelse false;
+    const split_body = dfy.getBool(item, "suspectBody");
+    const split_author = dfy.getBool(item, "suspectAuthor");
+    // 拆分字段由插件成对写入。规则分两层：
+    //
+    // 1. 任何一个存在的 `true` 都必须算数——它只可能来自抓取时对完整原文的
+    //    命中，副本之外看不看得见都不影响这条结论。只有 `suspectBody:true` 而
+    //    `suspectAuthor` 缺失时，正文仍要按可疑处理，不能被整条 `suspect`
+    //    的旧值盖过去。
+    // 2. 只有两个字段都在、且不自相矛盾时，才承认其中的 `false` 是抓取时的
+    //    结论。单独的 `suspectBody:false` 不能给整条 `suspect:true` 免死；两个
+    //    都在却都说 `false` 而整条仍可疑，说明 state 被改过，同样不认。
+    //
+    // 不认 `false` 时正文退回整条 `suspect`：宁可多标一句被拦下，也不能反过来
+    // 断言「正文本身没被拦下」。作者名没有可靠的整条兜底（整条可疑可能只因为
+    // 正文），所以只在字段为 `true` 或副本重扫命中时才算可疑。
+    const paired = split_body != null and split_author != null;
+    const contradicted = paired and !(split_body.? or split_author.?) and stored;
+    const trust_false = paired and !contradicted;
+    const author_suspect = (split_author orelse false) or looksLikeInjection(raw_author);
+    const body_suspect = (if (split_body) |flag| (flag or (!trust_false and stored)) else stored)
+        or looksLikeInjection(raw_body);
+    const body_view = clipChars(raw_body, Snapshot.peek_chars);
+    const author_view = clipChars(raw_author, Snapshot.peek_chars);
+    return .{
+        .kind = kind,
+        .label = peekLabel(kind),
+        .text = if (raw_body.len == 0) peekEmpty(kind) else if (body_view.len == 0) peek_unreadable else body_view,
+        .author = if (raw_author.len == 0) "未知作者" else if (author_view.len == 0) peek_unreadable else author_view,
+        .body_suspect = body_suspect,
+        .author_suspect = author_suspect,
+        .suspect = stored or body_suspect or author_suspect,
+    };
+}
+
+/// 按 id 在**当前**快照里找回条目。评论与回复要扫全部视频：`lastCommentId`
+/// 只在选中它那条视频的评论区里成立，而 `peek` 的目标可能来自 `comments`
+/// 命令（选中视频不变）或上一轮 tick。
+///
+/// 同一 id 在快照里出现多次时取**第一条**（`findById` 按顺序返回首个匹配）；
+/// 快照本身不按 id 去重，桥接重复喂同一个 id 时以先出现的那条为准。
+fn findInSnapshot(state: dfy.Value, kind: PeekKind, id: []const u8) ?dfy.Value {
+    if (id.len == 0) return null;
+    if (kind == .video) return findById(snapshotItems(state), id);
+    for (snapshotItems(state)) |video| {
+        if (video != .object) continue;
+        const comments = dfy.getList(video, "comments");
+        if (kind == .comment) {
+            if (findById(comments, id)) |hit| return hit;
+            continue;
+        }
+        for (comments) |comment| {
+            if (comment != .object) continue;
+            if (findById(dfy.getList(comment, "replies"), id)) |hit| return hit;
+        }
+    }
+    return null;
+}
+
+const PeekScan = struct {
+    /// 至少有一个可查看的目标，哪怕它没被拦下。
+    any: bool,
+    /// 第一个被拦下的目标；`null` 表示这轮没有可念的拦下内容。
+    withheld: ?PeekTarget,
+};
+
+/// 由近及远扫「回复 → 评论 → 视频」，返回第一个**可疑**的目标。最近一层
+/// 干净不代表别的层也干净：刚挑了一条干净回复时，被拦下的评论仍然要给出来。
+fn scanPeek(state: dfy.Value) PeekScan {
+    var scan = PeekScan{ .any = false, .withheld = null };
+    const layers = [_]struct { kind: PeekKind, key: []const u8 }{
+        .{ .kind = .reply, .key = "lastReplyId" },
+        .{ .kind = .comment, .key = "lastCommentId" },
+        .{ .kind = .video, .key = "lastId" },
+    };
+    for (layers) |layer| {
+        const id = dfy.getStr(state, layer.key) orelse "";
+        const item = findInSnapshot(state, layer.kind, id) orelse continue;
+        const target = peekTargetOf(item, layer.kind) orelse continue;
+        scan.any = true;
+        if (target.suspect) {
+            scan.withheld = target;
+            return scan;
+        }
+    }
+    return scan;
+}
+
+/// 只有用户显式发 `peek` 才把被拦下的正文念出来，而且它仍然只是素材：
+/// 这段文字不参与任何判定，也绝不会进入写请求。目标按「回复 → 评论 → 视频」
+/// 由近及远解析，`suspect` 从当前快照重新读——state 里那份副本只说明上一次
+/// 选中时看到过什么，快照换了一轮就不再可信。
+///
+/// `browse` / `comments` 不选中任何东西，所以先看本轮记下的那条；它和选中
+/// 目标一样要回快照里重新核对，找不到或已经不可疑就退回全层扫描。
+fn commandPeek(ctx: *dfy.Context, counter: i64) !void {
+    const reply = ctx.reply;
+    var any = false;
+    var withheld: ?PeekTarget = null;
+    const recorded_kind = peekKindOfName(dfy.getStr(ctx.state, "withheldKind") orelse "");
+    const recorded_id = dfy.getStr(ctx.state, "withheldId") orelse "";
+    if (recorded_kind) |kind| {
+        if (findInSnapshot(ctx.state, kind, recorded_id)) |item| {
+            if (peekTargetOf(item, kind)) |target| {
+                any = true;
+                if (target.suspect) withheld = target;
+            }
+        }
+    }
+    if (withheld == null) {
+        const scanned = scanPeek(ctx.state);
+        any = any or scanned.any;
+        withheld = scanned.withheld;
+    }
+    const target = withheld orelse {
+        if (any) {
+            try reply.say("这条没有被拦下的内容。");
+            reply.status("这条没有被拦下", null, counter);
+        } else {
+            try reply.say("没有可查看的目标，先 pick 一条。");
+            reply.status("没有可查看的目标", null, counter);
+        }
+        return;
+    };
+    var builder = SayBuilder{};
+    if (target.body_suspect) {
+        builder.append(peek_fixed.body_label_prefix);
+        builder.append(target.label);
+        builder.append(peek_fixed.body_lead);
+        if (target.author_suspect) {
+            // 正文与作者名各中一部分：分开念，别混成一句话。
+            builder.appendClipped(target.text, peek_glue.body_then_author);
+            builder.append(peek_fixed.author_lead);
+            builder.appendClipped(target.author, peek_glue.quote);
+            builder.append(peek_fixed.close);
+        } else {
+            builder.appendClipped(target.text, peek_glue.body_then_mention);
+            builder.append(peek_fixed.mention_lead);
+            builder.appendClipped(target.author, 0);
+        }
+    } else {
+        // 正文本身干净，被拦下的只是作者名：说清拦的是哪一部分，正文照抄。
+        builder.append(target.label);
+        builder.append(peek_fixed.author_only_lead);
+        builder.appendClipped(target.author, peek_glue.author_then_body);
+        builder.append(peek_fixed.body_lead_only_author);
+        builder.appendClipped(target.text, peek_glue.quote);
+        builder.append(peek_fixed.close);
+    }
+    try reply.say(builder.slice());
+    reply.status(builder.slice(), null, counter);
 }
 
 /// 命令入口：只认命令名与编号。命令的 `args` 里除了 1 起的 `index` 之外
@@ -1338,6 +2161,9 @@ fn handleCommand(
         try reply.stateInt("counter", 0);
         try reply.stateRemove("seen");
         try reply.stateRemove("seenCount");
+        // 旧版本在这里留下了标题 / 作者 / 可疑标记的副本，0.5.0 还额外写下
+        // `lastFetchAt` 与 `available` 两个没人读的计数；0.5.1 起只认快照、那两个
+        // 计数也不再写，这几条删除保留，专门清理旧版本留下的键。
         try reply.stateRemove("lastTitle");
         try reply.stateRemove("lastUrl");
         try reply.stateRemove("lastFetchAt");
@@ -1352,6 +2178,7 @@ fn handleCommand(
         try reply.stateRemove("pickIndex");
         try reply.stateRemove("browsePage");
         try clearCommentSelection(reply);
+        try recordWithheld(reply, null, "");
         try reply.stateRemove("pendingWrite");
         try reply.stateRemove("writeInFlight");
         try reply.stateRemove("writeInFlightAt");
@@ -1419,6 +2246,10 @@ fn handleCommand(
     }
     if (dfy.eql(name, "comments")) {
         try commandComments(ctx, counter);
+        return true;
+    }
+    if (dfy.eql(name, "peek")) {
+        try commandPeek(ctx, counter);
         return true;
     }
     if (dfy.eql(name, "pick-comment")) {
@@ -1492,23 +2323,26 @@ fn selectVideo(ctx: *dfy.Context, index: usize) !void {
     if (std.fmt.bufPrint(&head_buffer, "选中第 {d}/{d} 条：", .{ index + 1, videos.len })) |head| {
         builder.append(head);
     } else |_| {}
-    builder.append("「");
-    builder.append(if (title.len == 0) "（无标题）" else title);
-    builder.append("」@");
-    builder.append(if (author.len == 0) "未知作者" else author);
-    writeSuspectNote(&builder, suspect);
+    if (suspect) {
+        appendWithheld(&builder);
+    } else {
+        builder.append("「");
+        builder.append(if (title.len == 0) "（无标题）" else title);
+        builder.append("」@");
+        builder.append(if (author.len == 0) "未知作者" else author);
+    }
     try reply.say(builder.slice());
     reply.status(builder.slice(), null, dfy.getInt(ctx.state, "counter") orelse 0);
 
     try reply.stateStr("lastId", id);
-    if (title.len > 0) try reply.stateStr("lastTitle", title);
-    if (author.len > 0) try reply.stateStr("lastAuthor", author);
-    try reply.stateBool("lastSuspect", suspect);
     if (dfy.getStr(item, "url")) |url| {
         if (isHttpsUrl(url)) try reply.stateStr("lastUrl", url);
     }
     try reply.stateInt("pickIndex", @intCast(index));
     try clearCommentSelection(reply);
+    // 选中的是可疑条目，才把指针给 `peek`；干净条目不动指针——选中一条正常
+    // 视频不该把刚被拦下的那条从 `peek` 里抹掉。
+    if (suspect) try recordWithheld(reply, .video, id);
 }
 
 fn selectedVideo(state: dfy.Value) ?dfy.Value {
@@ -1541,20 +2375,21 @@ fn selectComment(ctx: *dfy.Context, index: usize, comments: []const dfy.Value) !
     if (std.fmt.bufPrint(&head_buffer, "选中第 {d}/{d} 条评论：", .{ index + 1, comments.len })) |head| {
         builder.append(head);
     } else |_| {}
-    builder.append("「");
-    builder.append(text);
-    builder.append("」@");
-    builder.append(if (author.len == 0) "未知作者" else author);
-    writeSuspectNote(&builder, suspect);
+    if (suspect) {
+        appendWithheld(&builder);
+    } else {
+        builder.append("「");
+        builder.append(text);
+        builder.append("」@");
+        builder.append(if (author.len == 0) "未知作者" else author);
+    }
     try reply.say(builder.slice());
     reply.status(builder.slice(), null, dfy.getInt(ctx.state, "counter") orelse 0);
 
     try reply.stateStr("lastCommentId", id);
-    if (author.len > 0) try reply.stateStr("lastCommentAuthor", author);
-    if (text.len > 0) try reply.stateStr("lastCommentText", text);
-    try reply.stateBool("lastCommentSuspect", suspect);
     try reply.stateInt("commentIndex", @intCast(index));
     try clearReplySelection(reply);
+    if (suspect) try recordWithheld(reply, .comment, id);
 }
 
 fn selectReply(ctx: *dfy.Context, index: usize, replies: []const dfy.Value) !void {
@@ -1570,19 +2405,20 @@ fn selectReply(ctx: *dfy.Context, index: usize, replies: []const dfy.Value) !voi
     if (std.fmt.bufPrint(&head_buffer, "选中第 {d}/{d} 条回复：", .{ index + 1, replies.len })) |head| {
         builder.append(head);
     } else |_| {}
-    builder.append("「");
-    builder.append(text);
-    builder.append("」@");
-    builder.append(if (author.len == 0) "未知作者" else author);
-    writeSuspectNote(&builder, suspect);
+    if (suspect) {
+        appendWithheld(&builder);
+    } else {
+        builder.append("「");
+        builder.append(text);
+        builder.append("」@");
+        builder.append(if (author.len == 0) "未知作者" else author);
+    }
     try reply.say(builder.slice());
     reply.status(builder.slice(), null, dfy.getInt(ctx.state, "counter") orelse 0);
 
     try reply.stateStr("lastReplyId", id);
-    if (author.len > 0) try reply.stateStr("lastReplyAuthor", author);
-    if (text.len > 0) try reply.stateStr("lastReplyText", text);
-    try reply.stateBool("lastReplySuspect", suspect);
     try reply.stateInt("replyIndex", @intCast(index));
+    if (suspect) try recordWithheld(reply, .reply, id);
 }
 
 // ---------------------------------------------------------------------------
@@ -1742,20 +2578,25 @@ fn resolveTarget(state: dfy.Value, kind: WriteKind) struct { id: []const u8, pro
     };
 }
 
+/// 写守门的目标判定：把当前快照里那条内容重新拼成 `peek` 目标再取 `suspect`，
+/// 而不是盲信 state 里孤零零的一个布尔值。副本重扫只能补上漏标的命中；存下来的
+/// `true` 照样按可疑拦住（见 `peekTargetOf`），所以旧版本、状态迁移或手改状态把
+/// 标记改成 false，也放不出副本里仍带注入特征的内容。找不到目标、或者目标读不出
+/// 内容时一律按可疑拦住。
 fn targetIsSuspect(state: dfy.Value, kind: WriteKind) bool {
     const video_id = dfy.getStr(state, "lastId") orelse "";
     const video = findById(snapshotItems(state), video_id) orelse return true;
     if (kind != .reply and kind != .comment_like) {
-        return dfy.getBool(video, "suspect") orelse true;
+        return (peekTargetOf(video, .video) orelse return true).suspect;
     }
     const comment_id = dfy.getStr(state, "lastCommentId") orelse "";
     const comment = findById(dfy.getList(video, "comments"), comment_id) orelse return true;
     const reply_id = dfy.getStr(state, "lastReplyId") orelse "";
     if (kind == .comment_like or reply_id.len == 0) {
-        return dfy.getBool(comment, "suspect") orelse true;
+        return (peekTargetOf(comment, .comment) orelse return true).suspect;
     }
     const selected_reply = findById(dfy.getList(comment, "replies"), reply_id) orelse return true;
-    return dfy.getBool(selected_reply, "suspect") orelse true;
+    return (peekTargetOf(selected_reply, .reply) orelse return true).suspect;
 }
 
 fn requestWrite(
@@ -1994,7 +2835,14 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
                     } else {
                         var reason_buffer: [Guard.max_error * 4]u8 = undefined;
                         const reason = sanitize(&reason_buffer, written.reason, Guard.max_error);
-                        const shown = if (reason.len == 0) "桥接没有响应" else reason;
+                        // 失败理由也来自桥接，和 feed 文本一样可能被喂进攻击句；
+                        // 命中就只说一句「已拦下」，不把原文念出来。
+                        const shown = if (reason.len == 0)
+                            "桥接没有响应"
+                        else if (looksLikeInjection(written.reason))
+                            "理由像注入样本，已拦下"
+                        else
+                            reason;
                         const line = std.fmt.bufPrint(
                             &line_buffer,
                             "{s}失败：{s}",
@@ -2080,16 +2928,16 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
         };
         const ok = dfy.getBool(feed, "ok") orelse false;
         if (!ok) {
+            const raw_reason = dfy.getStr(feed, "error") orelse "桥接没有响应";
             var reason_buffer: [Guard.max_error * 4]u8 = undefined;
-            const reason = sanitize(
-                &reason_buffer,
-                dfy.getStr(feed, "error") orelse "桥接没有响应",
-                Guard.max_error,
-            );
+            const reason = sanitize(&reason_buffer, raw_reason, Guard.max_error);
             var buffer: [200]u8 = undefined;
-            const line = std.fmt.bufPrint(&buffer, "刷不动了：{s}", .{reason}) catch "刷不动了。";
+            // 桥接的错误理由同样是不可信输入：命中注入特征就只说「已拦下」。
+            const line = if (looksLikeInjection(raw_reason))
+                "刷不动了：桥接返回的理由像注入样本，已拦下"
+            else
+                std.fmt.bufPrint(&buffer, "刷不动了：{s}", .{reason}) catch "刷不动了。";
             reply.status(line, null, counter);
-            try reply.stateInt("available", 0);
             reply.schedule(clampSeconds(interval * 3));
             return;
         }
@@ -2107,8 +2955,6 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
         // 快照保留的前 `Snapshot.videos` 条里，否则会出现「选中了但没证明」。
         const writer = reply.stateWriter();
         try writeSnapshot(writer, items);
-        try reply.stateInt("lastFetchAt", ctx.now);
-        try reply.stateInt("available", @intCast(items.len));
         try reply.stateInt("browsePage", -1);
 
         var best: ?dfy.Value = null;
@@ -2144,7 +2990,11 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
         }
 
         const picked = best orelse {
-            try reply.stateInt("seenCount", 0);
+            // 这一轮一个字都不念，也没有评估任何一层（视频 / 评论 / 回复）的
+            // 可疑标记：指针**不能**在这里清空。快照虽然换过一轮，但同一批
+            // 已见条目往往还在里面；清掉指针会让 `peek` 再也找不到那条被拦下的
+            // 内容。留着的指针在 `peek` 时会回新快照核对：id 不在了、或不再
+            // 可疑，`peek` 自己会退回「回复 → 评论 → 视频」扫描，不会卡死。
             reply.status("这波推荐都刷过了，等一会儿再来。", null, counter);
             reply.schedule(clampSeconds(interval * 3));
             return;
@@ -2199,33 +3049,66 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
             }
         }
 
+        // 评论可疑与否只算一次：拼播报和下面写来源证明读的是同一份结论，
+        // 同一段文字不重扫。
+        const comment_suspect = if (best_comment) |comment|
+            looksLikeInjection(dfy.getStr(comment, "text") orelse "")
+                or looksLikeInjection(dfy.getStr(comment, "author") orelse "")
+        else
+            false;
+
         var builder = SayBuilder{};
-        builder.append("刷到：「");
-        builder.append(title);
-        builder.append("」@");
-        builder.append(author);
-        writeSuspectNote(&builder, video_suspect);
-        if (best_comment) |comment| {
-            var comment_text_buffer: [Guard.max_feed_text * 4]u8 = undefined;
-            const comment_text = sanitize(
-                &comment_text_buffer,
-                dfy.getStr(comment, "text") orelse "",
-                Guard.max_feed_text,
-            );
-            var comment_author_buffer: [Guard.max_author * 4]u8 = undefined;
-            const comment_author = sanitize(
-                &comment_author_buffer,
-                dfy.getStr(comment, "author") orelse "",
-                Guard.max_author,
-            );
-            const comment_suspect = looksLikeInjection(dfy.getStr(comment, "text") orelse "")
-                or looksLikeInjection(dfy.getStr(comment, "author") orelse "");
-            builder.append("；评论：「");
-            builder.append(comment_text);
+        builder.append("刷到：");
+        if (video_suspect) {
+            appendWithheld(&builder);
+        } else {
+            builder.append("「");
+            builder.append(title);
             builder.append("」@");
-            builder.append(if (comment_author.len == 0) "未知作者" else comment_author);
-            writeSuspectNote(&builder, comment_suspect);
+            builder.append(author);
         }
+        if (best_comment) |comment| {
+            const raw_comment_text = dfy.getStr(comment, "text") orelse "";
+            const raw_comment_author = dfy.getStr(comment, "author") orelse "";
+            // 可疑正文一个字都不进嘴里，连标题作者也不带出来。
+            builder.append("；评论：");
+            if (comment_suspect) {
+                appendWithheld(&builder);
+            } else {
+                var comment_text_buffer: [Guard.max_feed_text * 4]u8 = undefined;
+                const comment_text = sanitize(
+                    &comment_text_buffer,
+                    raw_comment_text,
+                    Guard.max_feed_text,
+                );
+                var comment_author_buffer: [Guard.max_author * 4]u8 = undefined;
+                const comment_author = sanitize(
+                    &comment_author_buffer,
+                    raw_comment_author,
+                    Guard.max_author,
+                );
+                builder.append("「");
+                builder.append(comment_text);
+                builder.append("」@");
+                builder.append(if (comment_author.len == 0) "未知作者" else comment_author);
+            }
+        }
+        // 本轮要记下的那一条：视频优先，其次是评论，最后才是自动回复的目标——
+        // 播报先念标题，所以标题可疑时指针就停在标题上。回复的正文本身不进播报
+        // （它只是自动回复的对象），被拦下时靠 `peek` 才看得到。`peek` 的回退
+        // 扫描方向相反（由近及远 回复 → 评论 → 视频），两者不冲突：指针先查，
+        // 查不到才扫描。指针在这一轮重记，三类都不可疑才清空；`browse` /
+        // `comments` 与选择命令只在真的遇上可疑条目时才写，不会替这里刷新指针。
+        var withheld_kind: ?PeekKind = null;
+        var withheld_id: []const u8 = "";
+        var video_evaluated = false;
+        var comment_evaluated = false;
+        var reply_evaluated = false;
+        if (video_suspect) {
+            withheld_kind = .video;
+            withheld_id = item_id;
+        }
+        video_evaluated = true;
         const line = builder.slice();
         try reply.say(line);
         if (@rem(counter, 3) == 2) try reply.play("吃Token");
@@ -2247,9 +3130,6 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
 
         try reply.stateInt("counter", counter + 1);
         try reply.stateStr("lastId", item_id);
-        try reply.stateStr("lastTitle", title);
-        try reply.stateStr("lastAuthor", author);
-        try reply.stateBool("lastSuspect", video_suspect);
         if (isHttpsUrl(url)) try reply.stateStr("lastUrl", url);
         // 新一轮抓取就把选择游标归零：第一次 pick / pick-comment 落在第一条。
         try reply.stateInt("pickIndex", -1);
@@ -2261,25 +3141,13 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
         // Provenance for later writes: only ids the bridge actually returned.
         if (best_comment) |comment| {
             const comment_id = dfy.getStr(comment, "id") orelse "";
-            var comment_text_buffer: [Guard.max_feed_text * 4]u8 = undefined;
-            const comment_text = sanitize(
-                &comment_text_buffer,
-                dfy.getStr(comment, "text") orelse "",
-                Guard.max_feed_text,
-            );
-            var comment_author_buffer: [Guard.max_author * 4]u8 = undefined;
-            const comment_author = sanitize(
-                &comment_author_buffer,
-                dfy.getStr(comment, "author") orelse "",
-                Guard.max_author,
-            );
-            const comment_suspect = looksLikeInjection(dfy.getStr(comment, "text") orelse "")
-                or looksLikeInjection(dfy.getStr(comment, "author") orelse "");
             try reply.stateStr("lastCommentId", comment_id);
-            try reply.stateStr("lastCommentAuthor", if (comment_author.len == 0) "未知作者" else comment_author);
-            try reply.stateStr("lastCommentText", comment_text);
-            try reply.stateBool("lastCommentSuspect", comment_suspect);
             try reply.stateInt("commentIndex", -1);
+            if (comment_suspect and withheld_kind == null) {
+                withheld_kind = .comment;
+                withheld_id = comment_id;
+            }
+            comment_evaluated = true;
             if (validId(comment_id) and !comment_suspect) {
                 auto_reply_target = comment_id;
                 auto_reply_suspect = false;
@@ -2302,25 +3170,15 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
             }
             if (chosen_reply) |item| {
                 const reply_id = dfy.getStr(item, "id") orelse "";
-                var reply_text_buffer: [Guard.max_feed_text * 4]u8 = undefined;
-                const reply_text = sanitize(
-                    &reply_text_buffer,
-                    dfy.getStr(item, "text") orelse "",
-                    Guard.max_feed_text,
-                );
-                var reply_author_buffer: [Guard.max_author * 4]u8 = undefined;
-                const reply_author = sanitize(
-                    &reply_author_buffer,
-                    dfy.getStr(item, "author") orelse "",
-                    Guard.max_author,
-                );
                 const reply_suspect = looksLikeInjection(dfy.getStr(item, "text") orelse "")
                     or looksLikeInjection(dfy.getStr(item, "author") orelse "");
                 try reply.stateStr("lastReplyId", reply_id);
-                try reply.stateStr("lastReplyAuthor", if (reply_author.len == 0) "未知作者" else reply_author);
-                try reply.stateStr("lastReplyText", reply_text);
-                try reply.stateBool("lastReplySuspect", reply_suspect);
                 try reply.stateInt("replyIndex", -1);
+                if (reply_suspect and withheld_kind == null) {
+                    withheld_kind = .reply;
+                    withheld_id = reply_id;
+                }
+                reply_evaluated = true;
                 // 目标回复可疑时退回评论；评论也可疑就由 auto_reply_suspect
                 // 保持为 true，整轮自动回复作废。
                 if (validId(reply_id) and !reply_suspect) {
@@ -2328,6 +3186,7 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
                 }
             } else {
                 try reply.stateRemove("lastReplyId");
+                // 旧版本留下的副本，仅清理。
                 try reply.stateRemove("lastReplyAuthor");
                 try reply.stateRemove("lastReplyText");
                 try reply.stateRemove("lastReplySuspect");
@@ -2337,6 +3196,11 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
             try clearCommentSelection(reply);
         }
 
+        if (withheld_kind) |withheld_target| {
+            try recordWithheld(reply, withheld_target, withheld_id);
+        } else if (video_evaluated and comment_evaluated and reply_evaluated) {
+            try recordWithheld(reply, null, "");
+        }
         reply.status(line, null, counter + 1);
 
         // 自主写入：一条视频最多一条，回复优先于收藏。
@@ -2392,7 +3256,13 @@ fn onEvent(ctx: *dfy.Context) anyerror!void {
                             reply.status("写入序号用尽", null, counter + 1);
                             write_blocked = true;
                         },
-                        .failed, .no_bridge, .already_wrote => reply.status("自动回复没发出去", null, counter + 1),
+                        .failed, .no_bridge, .already_wrote => {
+                            reply.status("自动回复没发出去", null, counter + 1);
+                            // 回复与收藏共用同一个桥接地址和事件预算：回复请求
+                            // 拼不出来时，收藏分支再试只会重复同一条失败提示
+                            // （甚至让人以为要发两笔）。本轮到此为止。
+                            write_blocked = true;
+                        },
                     }
                 } else {
                     reply.status("自动回复没发出去：设置里的回复正文不合规，手动执行一次 reply 会说明原因", null, counter + 1);

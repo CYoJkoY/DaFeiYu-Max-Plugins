@@ -292,6 +292,16 @@ pub fn eql(a: []const u8, b: []const u8) bool {
 // Response builder
 // ---------------------------------------------------------------------------
 
+/// Copy `text` into `dest`, cutting at a UTF-8 boundary when it does not fit.
+/// The reply outlives the handler frame, so the bytes have to live in the reply
+/// rather than in the caller's buffer.
+fn copyInto(dest: []u8, text: []const u8) []const u8 {
+    var len = @min(text.len, dest.len);
+    while (len < text.len and len > 0 and (text[len] & 0xC0) == 0x80) len -= 1;
+    @memcpy(dest[0..len], text[0..len]);
+    return dest[0..len];
+}
+
 /// One invocation's outgoing envelope, built up by the handler.
 ///
 /// `state` and the two effect lists are rendered separately and spliced at the
@@ -302,6 +312,21 @@ pub fn eql(a: []const u8, b: []const u8) bool {
 /// `stateRemove` deletes one. That way a handler only has to describe what
 /// changed, and a `tick` that forgets to echo `seen` cannot silently erase it.
 pub const Reply = struct {
+    /// Room for the status line and the diagnostic line. `compose` runs after
+    /// the handler returned, so both are copied in rather than borrowed.
+    ///
+    /// `status_capacity` matches the longest status a handler builds (the
+    /// douyin plugin reuses its 1_600-byte say buffer for the panel line): a
+    /// shorter buffer would cut the panel text while the pet still reads the
+    /// whole sentence, and the truncation would be silent.
+    ///
+    /// `log_capacity` is deliberately smaller and allowed to truncate: the
+    /// diagnostic line is a debugging aid echoed into the host console, not
+    /// something the user reads whole, so 512 bytes of UTF-8-boundary cut is
+    /// an acceptable loss where a cut status line would not be.
+    const status_capacity: usize = 1_600;
+    const log_capacity: usize = 512;
+
     alloc: Allocator,
     /// The state the host handed us; anything not overridden is carried through.
     initial: Value,
@@ -309,9 +334,11 @@ pub const Reply = struct {
     effects: Json,
     pet: Json,
     status_text: ?[]const u8 = null,
+    status_buf: [status_capacity]u8 = undefined,
     status_progress: ?f64 = null,
     status_counter: ?i64 = null,
     log_text: ?[]const u8 = null,
+    log_buf: [log_capacity]u8 = undefined,
     schedule_ms: ?u64 = null,
     disable_flag: bool = false,
 
@@ -444,15 +471,23 @@ pub const Reply = struct {
     }
 
     /// Report a one-line status the panel can show. `progress` is 0..1.
+    ///
+    /// The text is copied into the reply: `compose` runs after the handler
+    /// returned, and callers normally pass a slice of their own stack buffer.
+    /// The buffer is `status_capacity` bytes; a longer `message` is cut at a
+    /// UTF-8 boundary and the tail is dropped, so keep the headline inside the
+    /// capacity if the panel text must match `say()` word for word.
     pub fn status(self: *Reply, message: []const u8, progress: ?f64, counter: ?i64) void {
-        self.status_text = message;
+        self.status_text = copyInto(&self.status_buf, message);
         self.status_progress = progress;
         self.status_counter = counter;
     }
 
     /// Attach a diagnostic line to the response (separate from `log()` streaming).
+    /// The buffer is `log_capacity` bytes; a longer `text` is cut at a UTF-8
+    /// boundary, which is acceptable for a console-only diagnostic.
     pub fn logText(self: *Reply, text: []const u8) void {
-        self.log_text = text;
+        self.log_text = copyInto(&self.log_buf, text);
     }
 
     /// Ask the host to fire another `tick` after `after_ms`.

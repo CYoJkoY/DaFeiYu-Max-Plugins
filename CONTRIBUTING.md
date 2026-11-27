@@ -37,13 +37,18 @@ zig build-exe -O ReleaseSmall -target wasm32-freestanding -fno-entry \
 ## 提交前自检
 
 ```sh
-node scripts/validate.ts     # 清单、模块、哈希与索引一致
+node scripts/check-languages.ts       # 全仓库只有 Zig + TypeScript
+node scripts/validate.ts              # 清单、模块、哈希与索引一致
 node scripts/build-plugin.ts --check  # 源码重编译后必须与 plugin.wasm 逐字节一致
-node scripts/test-plugin.ts  # 用 Node 的 WASM 运行时跑插件的确定性测试
-node scripts/build-index.ts  # 重算 size / sha256 并写回 index.json
+node scripts/test-plugin.ts           # 用 Node 的 WASM 运行时跑插件的确定性测试
+node scripts/build-index.ts           # 重算 size / sha256 并写回 index.json
 ```
 
-三条都通过后再提交 `index.json`。CI 也会跑同样的检查。
+四条都通过后再提交 `index.json`。CI 也会跑同样的检查。
+
+插件源码只用 Zig，工具脚本只用 TypeScript：这个仓库和主应用一起守着
+「Dart + Zig + TypeScript，至多三种」的上限，第四种语言的扩展名（`.js` / `.py` /
+`.ps1` / `.rs` / `.c` 等）会让 `check-languages.ts` 直接失败。
 
 改完 `src/main.zig` 不想手抄编译参数时，直接运行
 `node scripts/build-plugin.ts --write`：它用与主应用完全相同的参数逐个编译

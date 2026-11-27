@@ -17,6 +17,8 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
+      - name: Check the repository language ceiling
+        run: node scripts/check-languages.ts
       - name: Validate manifests and index
         run: node scripts/validate.ts
       - name: Rebuild every plug-in from source and compare

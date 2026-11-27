@@ -5,3 +5,5 @@ zig-cache/
 zig-out/
 *.tmp
 .DS_Store
+Thumbs.db
+desktop.ini

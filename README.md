@@ -18,6 +18,17 @@
 - 不收集任何用户数据；安装行为完全由用户在主应用面板里手动触发。
 - 不是 Magpie 页面，也不是桌宠本体。
 
+## 语言约定
+
+整个项目最多三种编程语言：**Dart + Zig + TypeScript**。Dart 只留在主应用
+（DaFeiYu-Max）里写 Flutter 界面；本仓库只需要后两种——**Zig** 写插件与 SDK，
+**TypeScript** 写校验、构建与测试脚本。除此之外的语言——JavaScript（含 `.cjs` /
+`.mjs`）、Python、PowerShell、Shell / 批处理、Rust、C / C++、C#、Kotlin、Ruby、
+Lua——都不进仓库。
+
+`node scripts/check-languages.ts` 以受版本控制的文件为基准检查这条上限（CI 第一步
+就运行）；出现第四种语言的扩展名、CI 漏掉本检查，或文档没写明语言约定都会失败。
+
 ## 目录结构
 
 ```
@@ -29,6 +40,7 @@ plugins/<id>/src/main.zig   可读源码
 plugins/<id>/plugin.wasm    编译产物（与清单 script.entry 同名）
 schema/index.schema.json    市场索引 JSON Schema
 scripts/icons.ts            从 PNG 母版重新生成 ICO
+scripts/check-languages.ts  检查全仓库只有 Zig + TypeScript
 scripts/lib/png.ts          PNG 编解码、缩放与 ICO 容器（仅标准库）
 scripts/validate.ts         校验清单、模块与索引一致性
 scripts/build-index.ts      按现有模块重算 size / sha256 并重建 index.json

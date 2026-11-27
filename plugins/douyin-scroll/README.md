@@ -8,7 +8,11 @@
 ## 它依赖什么
 
 插件自身不联网，也读不到浏览器。它只通过主应用的 `bridge` 权限向**本机**的
-抖音桥接服务发请求，剩下的（请求、桌宠动作、状态持久化）都由主应用执行。
+抖音桥接服务发请求，剩下的（请求、桌宠动作、状态持久化）都由宿主执行。
+
+宿主就是主应用里的脚本运行时。**Flutter 版 0.1.x 还没有接上运行时**：现在把
+这个插件装进主应用，它只会出现在插件列表里并标注「已安装 · 运行时未接入」，
+下面这些端点一个都不会被调用。0.1.7 及更早的 Electron 版本跑过它。
 
 桥接服务需要由你自己运行（例如一个本机小服务），端点如下：
 
@@ -373,5 +377,9 @@ node scripts/build-plugin.ts --write
 四个导出符号。之后在仓库根运行 `node scripts/test-plugin.ts`、
 `node scripts/validate.ts` 与 `node scripts/build-index.ts`。
 
-想先在本地试跑而不发布，可以把这份 `main.zig` 直接拖进主应用的「安装本地插件」，
-它会用你机器上的 Zig 编译并装进本地插件目录，完全不上传。
+想把没发布的版本装到本地面板里看看，可以手工建一份插件目录：把 `plugin.json` 与
+`plugin.wasm` 放进应用数据目录的 `plugins/<id>/`（Windows 是
+`%APPDATA%\BlueDaFeiYu-Codex\plugins\`，macOS 是
+`~/Library/Application Support/BlueDaFeiYu-Codex/plugins/`），重启应用后会出现在
+插件列表，同样标注「运行时未接入」。Flutter 版没有「安装本地插件」按钮，也不在
+应用内编译 Zig；真正的执行要等运行时迁移回来。

@@ -9,7 +9,9 @@
 
 - 每个 `plugins/<id>/` 目录包含一份 `plugin.json` 清单、编译好的 `plugin.wasm`
   和（可选的）`src/main.zig` 源码。
-- 插件是 **Zig 源码编译出的 WASM 模块**，运行在主应用的 worker 沙箱里。
+- 插件是 **Zig 源码编译出的 WASM 模块**，由主应用里的脚本运行时加载——Flutter
+  版 0.1.x 还没接上运行时，现阶段只做「取回、校验、安装、卸载」，见下方
+  [与主应用的关系](#与主应用的关系)。
 - 主应用通过 SHA-256 与大小双重校验，保证下载到的模块与索引记录完全一致。
 
 ## 它不是什么
@@ -17,6 +19,27 @@
 - 不托管任何会自动执行、自动安装或自动发送内容的组件。
 - 不收集任何用户数据；安装行为完全由用户在主应用面板里手动触发。
 - 不是 Magpie 页面，也不是桌宠本体。
+
+## 与主应用的关系
+
+消费方是同级仓库 [`CYoJkoY/DaFeiYu-Max`](https://github.com/CYoJkoY/DaFeiYu-Max)
+（Flutter 版蓝色大肥鱼）。两边靠一份 JSON 契约连起来，没有服务器、没有 token：
+
+| 环节 | 这里负责 | 主应用负责 |
+| --- | --- | --- |
+| 浏览市场 | `index.json` 由 `scripts/build-index.ts` 生成并随提交发布 | 从 `raw.githubusercontent.com/<repo>/<ref>/index.json` 读一次 |
+| 校验 | `scripts/validate.ts` 用主应用同一套规则预检清单、路径、权限与哈希 | `lib/core/market.dart` 落地 `index.json` 与 `plugin.json` 的产物与边界 |
+| 安装 | 保证清单、模块与索引三者一致 | 下载后按 `size` 与 SHA-256 复核，先写 `.staging-<id>/` 再整目录改名 |
+| 卸载 | 无需参与 | 只删自己在 `plugin-market.json` 里记过账的插件 |
+
+主应用侧的完整契约（字段、校验顺序、磁盘布局、已知边界）写在
+[`docs/plugin-market.md`](https://github.com/CYoJkoY/DaFeiYu-Max/blob/main/docs/plugin-market.md)。
+
+**当前状态要如实说明**：Flutter 版主应用已经能把这里的插件装进本地并校验通过，
+但**脚本插件运行时尚未迁移**，所以装好的模块不会被执行，面板会标成
+「已安装 · 运行时未接入」。0.1.7 及更早的 Electron 版本确实跑过这些模块，那段
+执行能力要等运行时迁移回来才恢复。因此本仓库不承诺「装上就能用」，也不在文案里
+描述主应用当前没有的执行行为。
 
 ## 语言约定
 

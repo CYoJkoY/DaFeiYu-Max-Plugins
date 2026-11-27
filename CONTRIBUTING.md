@@ -46,6 +46,13 @@ node scripts/build-index.ts           # 重算 size / sha256 并写回 index.jso
 
 四条都通过后再提交 `index.json`。CI 也会跑同样的检查。
 
+`node scripts/validate.ts` 复刻的是主应用 `lib/core/market.dart` 的接受规则：
+索引与清单的体积上限、`schemaVersion`、条目字段长度、权限取值、`manifest` / `wasm`
+必须是 `plugins/<id>/…` 这类仓库内相对路径，并且索引里的版本要与清单一致。它绿灯
+意味着主应用会接受这份 `index.json`，不会出现「仓库自检通过、应用拒收」的情况。
+规则改动必须两边一起改——主应用侧契约见
+[`docs/plugin-market.md`](https://github.com/CYoJkoY/DaFeiYu-Max/blob/main/docs/plugin-market.md)。
+
 插件源码只用 Zig，工具脚本只用 TypeScript：这个仓库和主应用一起守着
 「Dart + Zig + TypeScript，至多三种」的上限，第四种语言的扩展名（`.js` / `.py` /
 `.ps1` / `.rs` / `.c` 等）会让 `check-languages.ts` 直接失败。
